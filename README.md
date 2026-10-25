@@ -17,12 +17,12 @@ On a trusted Linux node, start the agent and it will request enrollment from Cra
 ```sh
 git clone https://github.com/cozilic/craftpilot-runtime-agent.git
 cd craftpilot-runtime-agent
-./setup.sh
+sh setup.sh
 docker compose up -d --build
 docker compose logs -f runtime-agent
 ```
 
-`setup.sh` copies `.env.example` to a private `.env` file (mode `600`), detects `DOCKER_GID` from `/var/run/docker.sock`, prepares `/srv/craftpilot/servers` with the Minecraft runtime group (default GID 33), and validates the resolved Compose configuration. It preserves any existing `.env` settings and only updates `DOCKER_GID`. If directory ownership changes require it, the script asks `sudo` for permission; alternatively run it as root. Review `.env` before starting if the host uses a different server-data path or group.
+`sh setup.sh` copies `.env.example` to a private `.env` file (mode `600`), detects `DOCKER_GID` from `/var/run/docker.sock`, prepares `/srv/craftpilot/servers` with the Minecraft runtime group (default GID 33), and validates the resolved Compose configuration. Running it through `sh` avoids depending on the executable bit being preserved by Git, ZIP downloads, or the host filesystem. It preserves any existing `.env` settings and only updates `DOCKER_GID`. If directory ownership changes require it, the script asks `sudo` for permission; alternatively run it as root. Review `.env` before starting if the host uses a different server-data path or group.
 
 The Compose file builds the current checkout and persists the enrollment request and, after approval, the agent credential and heartbeat sequence in the `agent_state` volume. The agent displays its request ID in logs; Sysadmin → Ops & log → Runtime nodes shows pending requests. Once approved, it fetches its identity automatically and appears online. For the default `/srv/craftpilot/servers` path, both the agent and each server container use that same bind-mounted host directory; `CRAFTPILOT_DOCKER_SERVER_DATA_ROOT` configures the path passed to the Docker daemon. The initial data directory and staged snapshot directories use the configured data GID (default 33) and setgid. Compose gives the agent a `0002` umask so new files created during later work remain group-writable. After enrollment succeeds, the agent saves its long-lived credential with restrictive permissions; protect and back up the `agent_state` volume as a secret. Use only one agent and state volume per node. If state is lost, ask a sysadmin to disable/re-enroll the node rather than copying credentials.
 

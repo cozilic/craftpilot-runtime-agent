@@ -1,4 +1,5 @@
 #!/usr/bin/env sh
+# Invoke portably with `sh setup.sh`; Git checkouts on some hosts omit +x.
 set -eu
 umask 077
 
@@ -44,7 +45,6 @@ if [ ! -f .env ]; then
   echo "Created .env from .env.example."
 fi
 
-# Replace only DOCKER_GID; keep all user-configured values and comments.
 ENV_TMP=$(mktemp .env.tmp.XXXXXX)
 trap 'rm -f "$ENV_TMP"' EXIT HUP INT TERM
 if grep -q '^DOCKER_GID=' .env; then
@@ -57,7 +57,6 @@ chmod 600 "$ENV_TMP"
 mv -f -- "$ENV_TMP" .env
 chmod 600 .env
 
-# Parse simple KEY=value settings as data; never source .env as shell code.
 SERVER_DATA_PATH=$(sed -n 's/^CRAFTPILOT_SERVER_DATA_HOST_PATH=//p' .env | tail -n 1)
 SERVER_DATA_PATH=${SERVER_DATA_PATH:-/srv/craftpilot/servers}
 case "$SERVER_DATA_PATH" in
@@ -83,8 +82,6 @@ case "$SERVER_DATA_PATH" in
     exit 1
     ;;
 esac
-# Reject symlinked ancestors too: chmod/chgrp must never follow a configured
-# path out of the intended dedicated host directory.
 CHECK_PATH=
 PATH_PARTS=${SERVER_DATA_PATH#/}
 while [ -n "$PATH_PARTS" ]; do
