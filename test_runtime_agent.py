@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -23,6 +24,7 @@ SPEC.loader.exec_module(agent_module)
 Config = agent_module.Config
 AgentError = agent_module.AgentError
 DockerRuntime = agent_module.DockerRuntime
+RuntimeNodeAgent = agent_module.RuntimeNodeAgent
 
 SERVER_ID = "e7b4b542-70b0-4cf7-a2ac-2a6597de165d"
 CONTAINER_NAME = "craftpilot-e7b4b542"
@@ -75,6 +77,63 @@ class FakeDocker:
         if args[:2] == ["docker", "stop"] or args[:2] == ["docker", "kill"]:
             return SimpleNamespace(returncode=0, stdout=CONTAINER_NAME, stderr="")
         raise AssertionError(f"Unexpected Docker call: {args}")
+
+
+class EnrollmentTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        base = make_config(self.root)
+        self.config = Config(
+            master_url=base.master_url,
+            node_id=None,
+            registration_token=None,
+            state_dir=base.state_dir,
+            data_root=base.data_root,
+            images=base.images,
+        )
+        self.agent = RuntimeNodeAgent(self.config, runtime=SimpleNamespace(config=self.config), store=agent_module.StateStore(self.config.state_dir))
+
+    def test_first_start_creates_and_persists_request_then_saves_approved_credentials(self):
+        calls = []
+        request_id = "9f4a2d91-728a-4e9e-a4a2-a580f263da66"
+        node_id = "9f4a2d91-728a-4e9e-a4a2-a580f263da67"
+        secret = "s" * 64
+        credential = "c" * 64
+
+        def fake_request(method, path, body, credential=False):
+            calls.append((method, path, body))
+            if path == "/api/runtime/enrollments":
+                return {"request_id": request_id, "request_secret": secret}
+            if path.endswith("/poll"):
+                return {"status": "approved", "node_id": node_id, "credential": credential_value, "master_url": self.config.master_url}
+            if path.endswith("/complete"):
+                return {"status": "completed"}
+            raise AssertionError(path)
+
+        credential_value = credential
+        self.agent._request = fake_request
+        self.assertFalse(self.agent.ensure_registered())
+        saved = self.agent.store.load()
+        self.assertEqual(request_id, saved["enrollment_request_id"])
+        self.assertEqual(secret, saved["enrollment_request_secret"])
+        self.assertTrue(self.agent.poll_enrollment_once())
+        self.assertEqual(node_id, self.agent.config.node_id)
+        self.assertEqual(credential, self.agent.state["credential"])
+        self.assertNotIn("enrollment_request_id", self.agent.state)
+        self.assertEqual("/api/runtime/enrollments", calls[0][1])
+        self.assertTrue(calls[-1][1].endswith("/complete"))
+        self.assertEqual(node_id, self.agent.store.load()["node_id"])
+
+    def test_rejected_request_fails_closed_without_running_commands(self):
+        request_id = "9f4a2d91-728a-4e9e-a4a2-a580f263da66"
+        self.agent._request = lambda *_args, **_kwargs: {"request_id": request_id, "request_secret": "s" * 64}
+        self.agent.ensure_registered()
+        self.agent._request = lambda *_args, **_kwargs: {"status": "rejected"}
+        with self.assertRaisesRegex(AgentError, "rejected"):
+            self.agent.poll_enrollment_once()
+        self.assertIsNone(self.agent.state)
 
 
 class DockerRuntimeTests(unittest.TestCase):

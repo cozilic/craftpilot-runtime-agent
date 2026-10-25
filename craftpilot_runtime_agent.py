@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -56,7 +57,7 @@ class DockerError(AgentError):
 @dataclass(frozen=True)
 class Config:
     master_url: str
-    node_id: str
+    node_id: str | None
     registration_token: str | None
     state_dir: Path
     data_root: Path
@@ -66,11 +67,12 @@ class Config:
     stop_grace_seconds: int = 30
     docker_timeout_seconds: int = 45
     docker_data_root: str | None = None
+    data_gid: int = 33
 
     @classmethod
     def from_env(cls) -> "Config":
         master = os.environ.get("CRAFTPILOT_MASTER_URL", "").rstrip("/")
-        node_id = os.environ.get("CRAFTPILOT_NODE_ID", "").lower()
+        node_id = os.environ.get("CRAFTPILOT_NODE_ID", "").lower() or None
         token = os.environ.get("CRAFTPILOT_REGISTRATION_TOKEN") or None
         token_file = os.environ.get("CRAFTPILOT_REGISTRATION_TOKEN_FILE")
         if token is None and token_file:
@@ -80,13 +82,14 @@ class Config:
                 raise AgentError("could not read CRAFTPILOT_REGISTRATION_TOKEN_FILE") from exc
         state_dir = Path(os.environ.get("CRAFTPILOT_AGENT_STATE_DIR", "/var/lib/craftpilot-agent"))
         data_root = Path(os.environ.get("CRAFTPILOT_SERVER_DATA_ROOT", "/srv/craftpilot/servers"))
+        data_gid = _bounded_int("CRAFTPILOT_SERVER_DATA_GID", 33, 0, 2**31 - 1)
         configured_images = os.environ.get("CRAFTPILOT_ALLOWED_IMAGES", "")
         images = frozenset(item.strip() for item in configured_images.split(",") if item.strip()) or DEFAULT_IMAGES
         network = os.environ.get("CRAFTPILOT_DOCKER_NETWORK", "craftpilot-servers")
         poll_seconds = _bounded_int("CRAFTPILOT_POLL_SECONDS", 30, 5, 120)
         stop_grace = _bounded_int("CRAFTPILOT_STOP_GRACE_SECONDS", 30, 0, 45)
 
-        if not UUID_RE.fullmatch(node_id):
+        if node_id is not None and not UUID_RE.fullmatch(node_id):
             raise AgentError("CRAFTPILOT_NODE_ID must be a node UUID")
         if not master.startswith("https://"):
             raise AgentError("CRAFTPILOT_MASTER_URL must use HTTPS")
@@ -98,6 +101,7 @@ class Config:
         return cls(
             master, node_id, token, state_dir, data_root, images, network, poll_seconds, stop_grace,
             docker_data_root=os.environ.get("CRAFTPILOT_DOCKER_SERVER_DATA_ROOT") or None,
+            data_gid=data_gid,
         )
 
 
@@ -110,6 +114,17 @@ def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
     if not minimum <= value <= maximum:
         raise AgentError(f"{name} must be between {minimum} and {maximum}")
     return value
+
+
+def _prepare_shared_server_directory(path: Path, group_id: int) -> None:
+    """Give Minecraft's runtime GID access to a new staged server directory."""
+    if os.name == "nt":
+        return
+    try:
+        os.chown(path, -1, group_id)
+        os.chmod(path, 0o2770)
+    except OSError as exc:
+        raise AgentError(f"runtime agent cannot prepare server data for GID {group_id}") from exc
 
 
 class DockerRuntime:
@@ -192,6 +207,7 @@ class DockerRuntime:
         extract_path = staging / "extracted"
         extract_path.mkdir(mode=0o700)
         try:
+            _prepare_shared_server_directory(extract_path, self.config.data_gid)
             request = urllib.request.Request(download_url, headers={
                 "Accept": "application/zip",
                 "Authorization": f"Bearer {credential}",
@@ -246,6 +262,7 @@ class DockerRuntime:
                 if destination.is_symlink() or not destination.is_dir() or any(destination.iterdir()):
                     raise AgentError("snapshot destination is no longer empty; refusing to overwrite it")
                 destination.rmdir()
+            _prepare_shared_server_directory(extract_path, self.config.data_gid)
             os.replace(extract_path, destination)
             return {
                 "success": True,
@@ -442,7 +459,7 @@ class StateStore:
             if not stat.S_ISREG(info.st_mode):
                 os.close(descriptor)
                 raise AgentError("agent state path is not a regular file")
-            if info.st_mode & 0o077:
+            if os.name != "nt" and info.st_mode & 0o077:
                 os.fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "r", encoding="utf-8") as state_file:
                 state = json.load(state_file)
@@ -457,17 +474,19 @@ class StateStore:
         os.chmod(self.directory, 0o700)
         descriptor, temporary = tempfile.mkstemp(prefix=".agent-state-", dir=self.directory)
         try:
-            os.fchmod(descriptor, 0o600)
+            if os.name != "nt":
+                os.fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "w", encoding="utf-8") as state_file:
                 json.dump(state, state_file, separators=(",", ":"))
                 state_file.flush()
                 os.fsync(state_file.fileno())
             os.replace(temporary, self.path)
-            directory_fd = os.open(self.directory, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            if os.name != "nt":
+                directory_fd = os.open(self.directory, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
@@ -481,12 +500,21 @@ class RuntimeNodeAgent:
         self.state: dict[str, Any] | None = None
         self._opener = urllib.request.build_opener(_NoRedirectHandler())
 
-    def ensure_registered(self) -> None:
+    def ensure_registered(self) -> bool:
         state = self.store.load()
+        if state is not None and state.get("enrollment_request_id") and not state.get("credential"):
+            request_id = state.get("enrollment_request_id")
+            request_secret = state.get("enrollment_request_secret")
+            if not isinstance(request_id, str) or not UUID_RE.fullmatch(request_id) or not isinstance(request_secret, str) or not re.fullmatch(r"[A-Za-z0-9]{64}", request_secret):
+                raise AgentError("saved enrollment request is invalid")
+            self.pending_enrollment = {"request_id": request_id, "request_secret": request_secret}
+            return False
         if state is not None:
             credential = state.get("credential")
+            node_id = state.get("node_id")
             sequence = state.get("sequence")
-            if (state.get("node_id") != self.config.node_id
+            if ((node_id is not None and (not isinstance(node_id, str) or not UUID_RE.fullmatch(node_id)))
+                    or (self.config.node_id is not None and node_id is not None and node_id != self.config.node_id)
                     or not isinstance(credential, str)
                     or not re.fullmatch(r"[A-Za-z0-9]{64}", credential)
                     or isinstance(sequence, bool)
@@ -494,27 +522,121 @@ class RuntimeNodeAgent:
                     or not 0 <= sequence <= 2147483647):
                 raise AgentError("saved node credentials do not match the configured node")
             self.state = state
-            return
-        token = self.config.registration_token
-        if not token or not 32 <= len(token) <= 128:
-            raise AgentError("registration token is required for first enrollment")
-        result = self._request(
-            "POST", f"/api/runtime/nodes/{self.config.node_id}/register",
-            {"registration_token": token},
-        )
+            if isinstance(node_id, str):
+                self._set_node_id(node_id)
+            if state.get("enrollment_request_id") and isinstance(node_id, str):
+                self._complete_dynamic_enrollment()
+            return isinstance(node_id, str) and "enrollment_request_id" not in self.state
+
+        if self.config.node_id is not None:
+            token = self.config.registration_token
+            if not token or not 32 <= len(token) <= 128:
+                raise AgentError("registration token is required for first enrollment")
+            result = self._request(
+                "POST", f"/api/runtime/nodes/{self.config.node_id}/register",
+                {"registration_token": token},
+            )
+            credential = result.get("credential")
+            if result.get("node_id") != self.config.node_id or not isinstance(credential, str) or not re.fullmatch(r"[A-Za-z0-9]{64}", credential):
+                raise AgentError("master returned an invalid registration response")
+            master_url = result.get("master_url", self.config.master_url)
+            if not isinstance(master_url, str) or master_url.rstrip("/") != self.config.master_url:
+                raise AgentError("registration response master URL does not match configured HTTPS origin")
+            self.state = {"node_id": self.config.node_id, "credential": credential, "sequence": 0}
+            self.store.save(self.state)
+            os.environ.pop("CRAFTPILOT_REGISTRATION_TOKEN", None)
+            return True
+
+        return self._request_dynamic_enrollment()
+
+    def _set_node_id(self, node_id: str) -> None:
+        from dataclasses import replace
+
+        self.config = replace(self.config, node_id=node_id)
+        self.runtime.config = self.config
+
+    def _request_dynamic_enrollment(self) -> bool:
+        result = self._request("POST", "/api/runtime/enrollments", {
+            "hostname": socket.gethostname()[:255] or "craftpilot-agent",
+            "agent_version": "local-docker",
+        })
+        request_id = result.get("request_id")
+        request_secret = result.get("request_secret")
+        if not isinstance(request_id, str) or not UUID_RE.fullmatch(request_id) or not isinstance(request_secret, str) or not re.fullmatch(r"[A-Za-z0-9]{64}", request_secret):
+            raise AgentError("master returned an invalid enrollment request")
+        self.pending_enrollment = {"request_id": request_id, "request_secret": request_secret}
+        self.store.save({
+            "node_id": None,
+            "enrollment_request_id": request_id,
+            "enrollment_request_secret": request_secret,
+        })
+        print(f"Enrollment request {request_id} is waiting for sysadmin approval.", file=sys.stderr)
+        return False
+
+    def poll_enrollment_once(self) -> bool:
+        pending = getattr(self, "pending_enrollment", None)
+        if pending is None:
+            state = self.store.load()
+            if state is not None and state.get("enrollment_request_id"):
+                pending = {"request_id": state["enrollment_request_id"], "request_secret": state["enrollment_request_secret"]}
+                self.pending_enrollment = pending
+            else:
+                return self.ensure_registered()
+        result = self._request("POST", f"/api/runtime/enrollments/{pending['request_id']}/poll", {"request_secret": pending["request_secret"]})
+        status = result.get("status")
+        if status in ("pending", "rejected", "expired", "completed"):
+            if status in ("rejected", "expired"):
+                raise AgentError(f"runtime enrollment request was {status}")
+            return status == "completed"
+        node_id = result.get("node_id")
         credential = result.get("credential")
-        if result.get("node_id") != self.config.node_id or not isinstance(credential, str) or len(credential) != 64:
-            raise AgentError("master returned an invalid registration response")
-        master_url = result.get("master_url", self.config.master_url)
-        if not isinstance(master_url, str) or master_url.rstrip("/") != self.config.master_url:
-            raise AgentError("registration response master URL does not match configured HTTPS origin")
-        self.state = {"node_id": self.config.node_id, "credential": credential, "sequence": 0}
+        master_url = result.get("master_url")
+        if (status != "approved" or not isinstance(node_id, str) or not UUID_RE.fullmatch(node_id)
+                or not isinstance(credential, str) or not re.fullmatch(r"[A-Za-z0-9]{64}", credential)
+                or not isinstance(master_url, str) or master_url.rstrip("/") != self.config.master_url):
+            raise AgentError("master returned an invalid enrollment approval")
+        self._set_node_id(node_id)
+        self.state = {
+            "node_id": node_id, "credential": credential, "sequence": 0,
+            "enrollment_request_id": pending["request_id"],
+            "enrollment_request_secret": pending["request_secret"],
+        }
         self.store.save(self.state)
-        os.environ.pop("CRAFTPILOT_REGISTRATION_TOKEN", None)
+        return self._complete_dynamic_enrollment()
+
+    def _complete_dynamic_enrollment(self) -> bool:
+        assert self.state is not None
+        request_id = self.state.get("enrollment_request_id")
+        request_secret = self.state.get("enrollment_request_secret")
+        if not isinstance(request_id, str) or not isinstance(request_secret, str):
+            raise AgentError("saved enrollment confirmation is invalid")
+        try:
+            self._request("POST", f"/api/runtime/enrollments/{request_id}/complete", {"request_secret": request_secret})
+        except HttpStatusError as exc:
+            if exc.status != 409:
+                raise
+            self.state = None
+            self.store.save({
+                "node_id": None,
+                "enrollment_request_id": request_id,
+                "enrollment_request_secret": request_secret,
+            })
+            self.pending_enrollment = {"request_id": request_id, "request_secret": request_secret}
+            return False
+        self.state.pop("enrollment_request_id", None)
+        self.state.pop("enrollment_request_secret", None)
+        self.store.save(self.state)
+        self.pending_enrollment = None
+        return True
 
     def poll_once(self) -> None:
-        if self.state is None:
-            self.ensure_registered()
+        if self.state is None or (self.state is not None and self.state.get("enrollment_request_id")):
+            if self.state is not None and self.state.get("enrollment_request_id"):
+                if not self._complete_dynamic_enrollment():
+                    return
+            elif not self.ensure_registered():
+                self.poll_enrollment_once()
+                return
         assert self.state is not None
         sequence = self.state["sequence"] + 1
         if sequence > 2147483647:
@@ -555,11 +677,18 @@ class RuntimeNodeAgent:
         )
 
     def run_forever(self) -> None:
-        self.ensure_registered()
+        if self.ensure_registered():
+            print(f"CraftPilot runtime agent for node {self.config.node_id} is online.", file=sys.stderr)
         while True:
             started = time.monotonic()
             try:
-                self.poll_once()
+                if self.state is None:
+                    self.ensure_registered()
+                if self.state is not None and self.state.get("enrollment_request_id"):
+                    if self.poll_enrollment_once():
+                        print(f"CraftPilot runtime agent for node {self.config.node_id} is online.", file=sys.stderr)
+                else:
+                    self.poll_once()
             except HttpStatusError as exc:
                 if exc.status == 401:
                     raise AgentError("node credential was rejected or revoked; re-enroll the node") from exc
@@ -569,7 +698,7 @@ class RuntimeNodeAgent:
                     print(f"Master request failed ({exc.status}); retrying.", file=sys.stderr)
             except (AgentError, OSError, TimeoutError) as exc:
                 print(f"Agent iteration failed: {str(exc)[:300]}", file=sys.stderr)
-            delay = max(0.0, self.config.poll_seconds - (time.monotonic() - started))
+            delay = max(0.0, (15 if self.state is None or self.state.get("enrollment_request_id") else self.config.poll_seconds) - (time.monotonic() - started))
             time.sleep(delay)
 
     def _request(self, method: str, path: str, body: dict[str, Any], credential: bool = False) -> dict[str, Any]:
@@ -588,7 +717,7 @@ class RuntimeNodeAgent:
         )
         try:
             with self._opener.open(request, timeout=15) as response:
-                if response.status != 200:
+                if not 200 <= response.status < 300:
                     raise HttpStatusError(response.status)
                 raw = response.read(1024 * 1024 + 1)
         except urllib.error.HTTPError as exc:
@@ -625,7 +754,7 @@ def main() -> int:
             except BlockingIOError as exc:
                 raise AgentError("another agent process already holds the state lock") from exc
             signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-            print(f"CraftPilot runtime agent for node {config.node_id} started.", file=sys.stderr)
+            print(f"CraftPilot runtime agent started{f' for node {config.node_id}' if config.node_id else ''}.", file=sys.stderr)
             RuntimeNodeAgent(config).run_forever()
     except AgentError as exc:
         print(f"CraftPilot runtime agent: {exc}", file=sys.stderr)

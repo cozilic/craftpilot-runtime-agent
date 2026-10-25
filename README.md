@@ -1,68 +1,68 @@
 # CraftPilot Linux runtime-node agent
 
-This early slice supports one-time initial server `SNAPSHOT` staging and remote Minecraft container `START`/`STOP`. It is a Python 3 standard-library program that calls a local Docker CLI with argument arrays; it does not provide arbitrary host shell execution. It does not synchronize or migrate an existing world, relay console/log/stat events, or support remote file operations. The master proxy routes to the node's advertised public address and server port, so the node firewall and Gate reachability must be configured by the operator. Do not offer remote placement as full production hosting until remaining operations and end-to-end network paths are verified.
+The agent is an early runtime slice for remote CraftPilot nodes. It supports authenticated initial server `SNAPSHOT` staging and fixed Minecraft container `START`/`STOP` operations. It does not synchronize or migrate existing worlds, relay logs/console/stats, provide remote file operations, or establish end-to-end connectivity by itself. The node operator must configure firewall access to server ports and ensure the CraftPilot Gate host can reach the node's advertised public address.
 
-## Container image
+## Requirements and security
 
-The release workflow builds versioned images for GitHub Container Registry:
-
-```sh
-docker pull ghcr.io/cozilic/craftpilot-runtime-agent:v0.1.0
-```
-
-The first published image is private by default. Before CraftPilot hosts can pull it without registry credentials, an owner must make the package public in GitHub Packages settings. GitHub does not document a supported Actions REST API endpoint for this setting. Once made public, the package cannot be made private again.
-
-Run a single agent per node under a supervisor. Mount the Docker socket, a private persistent state directory, and the server data directory; provide `CRAFTPILOT_MASTER_URL`, `CRAFTPILOT_NODE_ID` and the one-time enrollment token through a secret manager or protected environment file. Never put credentials in command arguments or logs. The source repo builds/publishes images for version tags (`v*`) using GitHub Actions; CraftPilot Compose should pin an explicit version tag rather than `latest`.
-
-## Requirements
-
-- Linux host with Python 3 and Docker CLI/daemon.
+- A trusted, dedicated Linux host with Docker Engine and Docker Compose v2.
 - HTTPS access from the node to the CraftPilot master.
-- A dedicated service account with narrowly controlled access to the Docker socket, its state directory and server data root. Access to the Docker socket is effectively host-root access; do not share it with untrusted users.
-- The configured server data root exists and is writable. For a new remote server, pre-create an empty `<data-root>/<server-uuid>` directory or let the snapshot flow create it; the agent stages its initial server files from the master by authenticated SNAPSHOT command. An existing empty destination is populated safely. A populated destination is never overwritten; existing master-world data can be copied only if it is included in that first snapshot and the node target has no conflicting files.
-- The runtime node has an operator-configured public address and inbound firewall rule for each server port. The master Gate proxy connects to `<public-address>:<server-port>`; verify that TCP path from the Gate host.
+- The local Docker daemon must manage both this agent and the Minecraft containers. The configured server-data host directory must be visible at the same path to the daemon.
+- The Docker socket (`/var/run/docker.sock`) gives effectively host-root access. The Compose service mounts it so the agent can create and manage allowlisted server containers; run only on a trusted host and never expose the socket over TCP.
+- Configure the host firewall and verify that CraftPilot Gate can connect to each advertised Minecraft port.
 
-## Enroll and run
+## Quick start on a new node
 
-Create/enable the node in the master admin inventory. Use the node UUID and one-time registration token from that response. Provide the token using a protected service environment or secret manager; do not put it in a command argument, repository, ticket, or public log. Install the versioned image from GHCR as described above, or use the local CraftPilot Compose overlay for an isolated development node.
-
-Required environment variables:
-
-- `CRAFTPILOT_MASTER_URL`: HTTPS origin, e.g. `https://craftpilot.se` (no API path).
-- `CRAFTPILOT_NODE_ID`: runtime node UUID from the admin inventory.
-- `CRAFTPILOT_REGISTRATION_TOKEN`: one-use token for the first run only (32–128 characters).
-
-Optional environment variables:
-
-- `CRAFTPILOT_AGENT_STATE_DIR`: credential/sequence/lock storage; defaults to `/var/lib/craftpilot-agent`.
-- `CRAFTPILOT_SERVER_DATA_ROOT`: per-server directories; defaults to `/srv/craftpilot/servers`.
-- `CRAFTPILOT_ALLOWED_IMAGES`: comma-separated exact Docker image allowlist. Defaults to the master Java image list: Temurin JRE 8, 11, 17, 21 and 25.
-- `CRAFTPILOT_DOCKER_NETWORK`: Docker bridge network name; defaults to `craftpilot-servers`.
-- `CRAFTPILOT_POLL_SECONDS`: polling interval from 5 to 120 seconds; defaults to 30.
-- `CRAFTPILOT_STOP_GRACE_SECONDS`: graceful Docker stop window from 0 to 45 seconds; defaults to 30.
-
-Run the versioned container under a supervisor such as systemd. Mount the Docker socket, a persistent private state directory at `/var/lib/craftpilot-agent`, and the server data root at `/srv/craftpilot/servers`:
+On a trusted Linux node, start the agent and it will request enrollment from CraftPilot. A sysadmin reviews the request and must approve it before the agent receives its node identity and credentials. You no longer need to create a node or copy a node ID/token by hand. The host still needs local Docker and filesystem settings. On the Linux node:
 
 ```sh
-docker run -d --name craftpilot-runtime-agent --restart unless-stopped \\
-  --env-file /etc/craftpilot/runtime-agent.env \\
-  -v /var/run/docker.sock:/var/run/docker.sock \\
-  -v craftpilot_runtime_agent_state:/var/lib/craftpilot-agent \\
-  -v /srv/craftpilot/servers:/srv/craftpilot/servers \\
-  ghcr.io/cozilic/craftpilot-runtime-agent:v0.1.0
+git clone https://github.com/cozilic/craftpilot-runtime-agent.git
+cd craftpilot-runtime-agent
 ```
 
-Use one process and one state directory per node. On first enrollment, the agent exchanges the registration token, writes its long-lived credential and heartbeat sequence into a mode-0600 state file inside a mode-0700 directory, then removes the registration token from its own environment. Protect the state directory as a secret. If it is lost, disable/re-enroll the node; do not copy an agent credential into chat or logs.
+Set the host-specific `DOCKER_GID` in `.env` before Compose starts. Find the socket group ID with `stat -c '%g' /var/run/docker.sock`. Prepare the host data directory with group 33 (the default Minecraft runtime group); Compose adds that group to the agent and staged snapshots are set group-writable for Minecraft. Protect `.env` with `chmod 600 .env`, then start from the cloned repo:
 
-## Docker and security boundaries
+```sh
+docker compose up -d --build
+docker compose logs -f runtime-agent
+```
 
-- Supported operations are exactly `snapshot`, `start` and `stop`; no command string from the master is executed on the host.
-- The container name is derived from the server UUID. Existing containers are reused/stopped only when Docker labels identify the same managed CraftPilot server.
-- New images must match the exact local allowlist. CPU, memory, port, user, command-wrapper, network, mount point and data path are validated before use.
-- Server data paths are resolved beneath `CRAFTPILOT_SERVER_DATA_ROOT`; symlinks are rejected. SNAPSHOT downloads only from the configured HTTPS master origin with the node credential, verifies the declared byte count and SHA-256, rejects ZIP traversal/symlinks/special files and decompression limits, extracts in a temporary directory and atomically installs only into a missing or empty destination. A nonempty directory is never overwritten.
-- Container labels and port mappings are set by the agent; Docker API access remains privileged. Restrict control-plane credentials and Docker socket access accordingly.
-- HTTPS redirects are not followed, and the agent does not disable certificate verification.
+The Compose file builds the current checkout and persists the enrollment request and, after approval, the agent credential and heartbeat sequence in the `agent_state` volume. The agent displays its request ID in logs; Sysadmin → Ops & log → Runtime nodes shows pending requests. Once approved, it fetches its identity automatically and appears online. For the default `/srv/craftpilot/servers` path, both the agent and each server container use that same bind-mounted host directory; `CRAFTPILOT_DOCKER_SERVER_DATA_ROOT` configures the path passed to the Docker daemon. The initial data directory and staged snapshot directories use the configured data GID (default 33) and setgid. Compose gives the agent a `0002` umask so new files created during later work remain group-writable. After enrollment succeeds, the agent saves its long-lived credential with restrictive permissions; protect and back up the `agent_state` volume as a secret. Use only one agent and state volume per node. If state is lost, ask a sysadmin to disable/re-enroll the node rather than copying credentials.
 
-## Staging verification checklist
+To install an updated agent revision, pull the desired repository branch or tag and run `docker compose up -d --build`. Check compatibility with the CraftPilot master before upgrading.
 
-Run the Docker-free local checks with `python3 -m unittest discover -s . -p 'test_*.py'` from the runtime-agent repo root. These fake the Docker CLI and cover authenticated snapshot delivery validation, size/digest checks, ZIP-slip rejection, safe staging and retry behavior, plus container/resource validation and data/label ownership boundaries. Then use a disposable Linux Docker host and a staging master to check registration and credential persistence, heartbeat replay rejection, fresh START, graceful STOP, forced STOP, already-running/already-stopped behavior, lease expiry/retry, revoked credentials and node outage. Verify Minecraft connectivity through the actual firewall/proxy path: a successful Docker start does not prove players can connect.
+## Configuration
+
+Required Compose variables:
+
+- `CRAFTPILOT_MASTER_URL`: HTTPS origin only, e.g. `https://craftpilot.se` (no API path).
+- `DOCKER_GID`: numeric group ID of `/var/run/docker.sock` on the host.
+
+`CRAFTPILOT_NODE_ID` and `CRAFTPILOT_REGISTRATION_TOKEN` are optional legacy/manual enrollment settings. Leave them unset for sysadmin-approved self-enrollment.
+- `CRAFTPILOT_SERVER_DATA_HOST_PATH`: absolute persistent host path, also visible to the Docker daemon when it creates game containers.
+
+Optional agent variables (set in `.env` if needed):
+
+- `CRAFTPILOT_SERVER_DATA_GID`: group ID used for shared server-data directories; default `33` (matches CraftPilot's default container user `33:33`).
+- `CRAFTPILOT_DOCKER_NETWORK`: game-container bridge network; default `craftpilot-servers`.
+- `CRAFTPILOT_ALLOWED_IMAGES`: comma-separated exact image allowlist. Defaults to Temurin JRE 8, 11, 17, 21 and 25 images.
+- `CRAFTPILOT_POLL_SECONDS`: polling interval 5–120; default 30.
+- `CRAFTPILOT_STOP_GRACE_SECONDS`: graceful stop timeout 0–45; default 30.
+
+For self-enrollment, no registration token is required. The agent creates a unique, expiring request secret, stores it with private permissions, and polls over HTTPS until the sysadmin approves or denies it. Approval creates an identity and credential for this single node; the agent saves that credential before acknowledging approval. Keep `.env` private and never commit it. The Compose build uses the code in the clone; publishing a GHCR image is a separate release step and is not required for this setup.
+
+## Runtime and safety boundaries
+
+- Only fixed `snapshot`, `start` and `stop` operations are supported; no arbitrary host-shell command is exposed.
+- Containers are named from server UUIDs and are reused/stopped only if CraftPilot ownership labels match. Images must exactly match the local allowlist; resource limits, port, user, network, mount point and data paths are validated.
+- Initial snapshots are downloaded only from the configured HTTPS master origin with the node credential; byte count and SHA-256 are verified. ZIP traversal, symlinks, special files, and excessive decompression are rejected. Files are extracted to a temporary directory and installed only into a missing or empty destination; populated destinations are never overwritten.
+- Docker socket access remains privileged. Restrict host access, enrollment credentials, token file, and agent state accordingly. HTTPS redirects are not followed and certificate verification is not disabled.
+
+## Tests and staging
+
+Run Docker-free checks from this repo root:
+
+```sh
+python3 -m unittest discover -s . -p 'test_*.py'
+```
+
+Before production use, test registration and credential persistence, heartbeat replay rejection, START/STOP, lease expiry/retry, revoked credentials, node outage, firewalling and actual Minecraft connectivity on a disposable Linux Docker host and staging master. A successful container start alone does not prove that players can connect.

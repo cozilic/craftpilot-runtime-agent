@@ -1,0 +1,34 @@
+services:
+  runtime-agent:
+    image: craftpilot-runtime-agent:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: craftpilot-runtime-agent
+    restart: unless-stopped
+    # Docker socket is privileged. Supplemental groups permit socket access
+    # and shared writes; the agent keeps staged data writable to Minecraft.
+    group_add:
+      - "${DOCKER_GID:?Set DOCKER_GID to the numeric group ID of /var/run/docker.sock}"
+      - "33"
+    command:
+      - /bin/sh
+      - -c
+      - umask 0002 && exec python /opt/craftpilot-runtime-agent/craftpilot_runtime_agent.py
+    environment:
+      CRAFTPILOT_MASTER_URL: ${CRAFTPILOT_MASTER_URL:-https://craftpilot.se}
+      CRAFTPILOT_NODE_ID: ${CRAFTPILOT_NODE_ID:-}
+      CRAFTPILOT_AGENT_STATE_DIR: /var/lib/craftpilot-agent
+      CRAFTPILOT_SERVER_DATA_ROOT: /srv/craftpilot/servers
+      # The Docker daemon must see this exact host path for child server mounts.
+      CRAFTPILOT_DOCKER_SERVER_DATA_ROOT: ${CRAFTPILOT_SERVER_DATA_HOST_PATH:-/srv/craftpilot/servers}
+      CRAFTPILOT_SERVER_DATA_GID: ${CRAFTPILOT_SERVER_DATA_GID:-33}
+      CRAFTPILOT_DOCKER_NETWORK: ${CRAFTPILOT_DOCKER_NETWORK:-craftpilot-servers}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - agent_state:/var/lib/craftpilot-agent
+      - ${CRAFTPILOT_SERVER_DATA_HOST_PATH:-/srv/craftpilot/servers}:/srv/craftpilot/servers
+    # Run only on a trusted, dedicated Linux node; never expose Docker socket over TCP.
+
+volumes:
+  agent_state:
