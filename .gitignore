@@ -1,6 +1,9 @@
 __pycache__/
 *.py[cod]
 .env
+.env.*
+!.env.example
 registration-token
+.env.tmp.*
 *.env
 server-data/

@@ -27,7 +27,11 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - agent_state:/var/lib/craftpilot-agent
-      - ${CRAFTPILOT_SERVER_DATA_HOST_PATH:-/srv/craftpilot/servers}:/srv/craftpilot/servers
+      - type: bind
+        source: ${CRAFTPILOT_SERVER_DATA_HOST_PATH:-/srv/craftpilot/servers}
+        target: /srv/craftpilot/servers
+        bind:
+          create_host_path: false
     # Run only on a trusted, dedicated Linux node; never expose Docker socket over TCP.
 
 volumes:
