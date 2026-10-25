@@ -65,12 +65,19 @@ class Config:
     poll_seconds: int = 30
     stop_grace_seconds: int = 30
     docker_timeout_seconds: int = 45
+    docker_data_root: str | None = None
 
     @classmethod
     def from_env(cls) -> "Config":
         master = os.environ.get("CRAFTPILOT_MASTER_URL", "").rstrip("/")
         node_id = os.environ.get("CRAFTPILOT_NODE_ID", "").lower()
         token = os.environ.get("CRAFTPILOT_REGISTRATION_TOKEN") or None
+        token_file = os.environ.get("CRAFTPILOT_REGISTRATION_TOKEN_FILE")
+        if token is None and token_file:
+            try:
+                token = Path(token_file).read_text(encoding="utf-8").strip() or None
+            except OSError as exc:
+                raise AgentError("could not read CRAFTPILOT_REGISTRATION_TOKEN_FILE") from exc
         state_dir = Path(os.environ.get("CRAFTPILOT_AGENT_STATE_DIR", "/var/lib/craftpilot-agent"))
         data_root = Path(os.environ.get("CRAFTPILOT_SERVER_DATA_ROOT", "/srv/craftpilot/servers"))
         configured_images = os.environ.get("CRAFTPILOT_ALLOWED_IMAGES", "")
@@ -88,7 +95,10 @@ class Config:
         if not images:
             raise AgentError("CRAFTPILOT_ALLOWED_IMAGES must not be empty")
 
-        return cls(master, node_id, token, state_dir, data_root, images, network, poll_seconds, stop_grace)
+        return cls(
+            master, node_id, token, state_dir, data_root, images, network, poll_seconds, stop_grace,
+            docker_data_root=os.environ.get("CRAFTPILOT_DOCKER_SERVER_DATA_ROOT") or None,
+        )
 
 
 def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -108,6 +118,7 @@ class DockerRuntime:
     def __init__(self, config: Config, runner=subprocess.run):
         self.config = config
         self.runner = runner
+        self._opener = urllib.request.build_opener(_NoRedirectHandler())
 
     def execute(
         self,
@@ -253,7 +264,8 @@ class DockerRuntime:
             return {"success": True, "result_code": "ALREADY_RUNNING", "container_id": self._container_id(name)}
 
         if existing is None:
-            data_path = self._server_data_path(server_id)
+            self._server_data_path(server_id)
+            data_path = self._docker_server_data_path(server_id)
             image = spec.get("image")
             if not isinstance(image, str) or image not in self.config.images:
                 raise AgentError("container image is not in the node allowlist")
@@ -324,6 +336,16 @@ class DockerRuntime:
         if resolved.parent != root or resolved == root:
             raise AgentError("server data path escapes the configured root")
         return resolved
+
+    def _docker_server_data_path(self, server_id: str) -> str:
+        """Return a Docker-daemon-visible mount path for the staged node directory."""
+        if self.config.docker_data_root is None:
+            return str(self._server_data_path(server_id))
+
+        root = self.config.docker_data_root.rstrip("/\\")
+        if not root or "\0" in root or "\n" in root or "\r" in root:
+            raise AgentError("Docker server data root is invalid")
+        return f"{root}/{server_id}"
 
     @staticmethod
     def _container_command(value: Any) -> list[str]:
@@ -483,6 +505,9 @@ class RuntimeNodeAgent:
         credential = result.get("credential")
         if result.get("node_id") != self.config.node_id or not isinstance(credential, str) or len(credential) != 64:
             raise AgentError("master returned an invalid registration response")
+        master_url = result.get("master_url", self.config.master_url)
+        if not isinstance(master_url, str) or master_url.rstrip("/") != self.config.master_url:
+            raise AgentError("registration response master URL does not match configured HTTPS origin")
         self.state = {"node_id": self.config.node_id, "credential": credential, "sequence": 0}
         self.store.save(self.state)
         os.environ.pop("CRAFTPILOT_REGISTRATION_TOKEN", None)

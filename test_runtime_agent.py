@@ -296,6 +296,25 @@ class DockerRuntimeTests(unittest.TestCase):
         self.assertIn("craftpilot.server_id=" + SERVER_ID, docker_run)
         self.assertIn("eclipse-temurin:21-jre", docker_run)
 
+    def test_docker_server_data_path_can_be_overridden_for_desktop_daemon(self):
+        self.config = Config(
+            master_url="https://master.example",
+            node_id="c4f6babc-0d57-4ab7-a71f-a6358498335a",
+            registration_token=None,
+            state_dir=self.root / "state",
+            data_root=self.root / "data",
+            images=frozenset({"eclipse-temurin:21-jre"}),
+            docker_data_root="C:/CraftPilot/runtime-data",
+        )
+        result = DockerRuntime(self.config, FakeDocker(["__missing__", "true", "b" * 64])).execute(
+            "start", {"server_id": SERVER_ID, "container": make_spec(self.config)},
+        )
+        self.assertEqual("STARTED", result["result_code"])
+        runtime = DockerRuntime(self.config, FakeDocker(["__missing__", "true", "b" * 64]))
+        runtime.execute("start", {"server_id": SERVER_ID, "container": make_spec(self.config)})
+        docker_run = next(call for call in runtime.runner.calls if call[:3] == ["docker", "run", "--detach"])
+        self.assertIn("C:/CraftPilot/runtime-data/" + SERVER_ID + ":/data:rw", docker_run)
+
     def test_start_refuses_unallowlisted_image_before_invoking_docker_run(self):
         runner = FakeDocker(["__missing__"])
         spec = make_spec(self.config)

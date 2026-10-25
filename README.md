@@ -2,6 +2,18 @@
 
 This early slice supports one-time initial server `SNAPSHOT` staging and remote Minecraft container `START`/`STOP`. It is a Python 3 standard-library program that calls a local Docker CLI with argument arrays; it does not provide arbitrary host shell execution. It does not synchronize or migrate an existing world, relay console/log/stat events, or support remote file operations. The master proxy routes to the node's advertised public address and server port, so the node firewall and Gate reachability must be configured by the operator. Do not offer remote placement as full production hosting until remaining operations and end-to-end network paths are verified.
 
+## Container image
+
+The release workflow builds versioned images for GitHub Container Registry:
+
+```sh
+docker pull ghcr.io/cozilic/craftpilot-runtime-agent:v0.1.0
+```
+
+The first published image is private by default. Before CraftPilot hosts can pull it without registry credentials, an owner must make the package public in GitHub Packages settings. GitHub does not document a supported Actions REST API endpoint for this setting. Once made public, the package cannot be made private again.
+
+Run a single agent per node under a supervisor. Mount the Docker socket, a private persistent state directory, and the server data directory; provide `CRAFTPILOT_MASTER_URL`, `CRAFTPILOT_NODE_ID` and the one-time enrollment token through a secret manager or protected environment file. Never put credentials in command arguments or logs. The source repo builds/publishes images for version tags (`v*`) using GitHub Actions; CraftPilot Compose should pin an explicit version tag rather than `latest`.
+
 ## Requirements
 
 - Linux host with Python 3 and Docker CLI/daemon.
@@ -12,7 +24,7 @@ This early slice supports one-time initial server `SNAPSHOT` staging and remote 
 
 ## Enroll and run
 
-Create/enable the node in the master admin inventory. Use the node UUID and one-time registration token from that response. Provide the token using a protected service environment or secret manager; do not put it in a command argument, repository, ticket, or public log.
+Create/enable the node in the master admin inventory. Use the node UUID and one-time registration token from that response. Provide the token using a protected service environment or secret manager; do not put it in a command argument, repository, ticket, or public log. Install the versioned image from GHCR as described above, or use the local CraftPilot Compose overlay for an isolated development node.
 
 Required environment variables:
 
@@ -29,10 +41,15 @@ Optional environment variables:
 - `CRAFTPILOT_POLL_SECONDS`: polling interval from 5 to 120 seconds; defaults to 30.
 - `CRAFTPILOT_STOP_GRACE_SECONDS`: graceful Docker stop window from 0 to 45 seconds; defaults to 30.
 
-Start under a supervisor such as systemd:
+Run the versioned container under a supervisor such as systemd. Mount the Docker socket, a persistent private state directory at `/var/lib/craftpilot-agent`, and the server data root at `/srv/craftpilot/servers`:
 
 ```sh
-python3 /opt/craftpilot/runtime-agent/craftpilot_runtime_agent.py
+docker run -d --name craftpilot-runtime-agent --restart unless-stopped \\
+  --env-file /etc/craftpilot/runtime-agent.env \\
+  -v /var/run/docker.sock:/var/run/docker.sock \\
+  -v craftpilot_runtime_agent_state:/var/lib/craftpilot-agent \\
+  -v /srv/craftpilot/servers:/srv/craftpilot/servers \\
+  ghcr.io/cozilic/craftpilot-runtime-agent:v0.1.0
 ```
 
 Use one process and one state directory per node. On first enrollment, the agent exchanges the registration token, writes its long-lived credential and heartbeat sequence into a mode-0600 state file inside a mode-0700 directory, then removes the registration token from its own environment. Protect the state directory as a secret. If it is lost, disable/re-enroll the node; do not copy an agent credential into chat or logs.
@@ -48,4 +65,4 @@ Use one process and one state directory per node. On first enrollment, the agent
 
 ## Staging verification checklist
 
-Run the Docker-free local checks with `python3 -m unittest discover -s runtime-agent -p 'test_*.py'`. These fake the Docker CLI and cover authenticated snapshot delivery validation, size/digest checks, ZIP-slip rejection, safe staging and retry behavior, plus container/resource validation and data/label ownership boundaries. Then use a disposable Linux Docker host and a staging master to check registration and credential persistence, heartbeat replay rejection, fresh START, graceful STOP, forced STOP, already-running/already-stopped behavior, lease expiry/retry, revoked credentials and node outage. Verify Minecraft connectivity through the actual firewall/proxy path: a successful Docker start does not prove players can connect.
+Run the Docker-free local checks with `python3 -m unittest discover -s . -p 'test_*.py'` from the runtime-agent repo root. These fake the Docker CLI and cover authenticated snapshot delivery validation, size/digest checks, ZIP-slip rejection, safe staging and retry behavior, plus container/resource validation and data/label ownership boundaries. Then use a disposable Linux Docker host and a staging master to check registration and credential persistence, heartbeat replay rejection, fresh START, graceful STOP, forced STOP, already-running/already-stopped behavior, lease expiry/retry, revoked credentials and node outage. Verify Minecraft connectivity through the actual firewall/proxy path: a successful Docker start does not prove players can connect.
