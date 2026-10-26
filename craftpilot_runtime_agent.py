@@ -778,6 +778,8 @@ class RuntimeNodeAgent:
         command_server_id = payload.get("server_id")
         if not isinstance(command_server_id, str) or not UUID_RE.fullmatch(command_server_id):
             command_server_id = "invalid"
+        else:
+            self._clear_unassigned_server(command_server_id)
         LOGGER.info("command_received command_id=%s type=%s server_id=%s", command_id, command_type, command_server_id)
         if command_type == "start":
             server_id = payload.get("server_id")
@@ -812,6 +814,8 @@ class RuntimeNodeAgent:
                     self.store.save(self.state)
         self._request("POST", f"/api/runtime/nodes/{self.config.node_id}/commands/{command_id}/ack",
                       {"lease_token": lease_token, **result}, credential=True)
+        if result.get("success") and command_type in ("start", "stop", "snapshot"):
+            self._clear_unassigned_server(command_server_id)
         if result.get("success"):
             LOGGER.info("command_completed command_id=%s type=%s server_id=%s result=%s",
                         command_id, command_type, command_server_id, result.get("result_code", "unknown"))
@@ -822,11 +826,36 @@ class RuntimeNodeAgent:
         cursors = self.state.setdefault("log_cursors", {})
         if not isinstance(cursors, dict):
             raise AgentError("saved runtime log cursors are invalid")
+        unassigned_servers = self._unassigned_server_ids()
         try:
             server_ids = self._assigned_server_ids()
-        except (AgentError, DockerError, OSError, TimeoutError):
+            assigned_response = self._request(
+                "GET", f"/api/runtime/nodes/{self.config.node_id}/servers", {}, credential=True,
+            )
+            assigned_server_ids = assigned_response.get("servers")
+            if (not isinstance(assigned_server_ids, list)
+                    or any(not isinstance(server_id, str) or not UUID_RE.fullmatch(server_id)
+                           for server_id in assigned_server_ids)):
+                raise AgentError("master returned an invalid server assignment list")
+        except HttpStatusError as exc:
+            if exc.status == 401:
+                raise
+            LOGGER.warning("server_assignments_unavailable status=%d", exc.status)
             return
+        except (AgentError, DockerError, OSError, TimeoutError) as exc:
+            LOGGER.warning("server_assignments_unavailable error=%s", str(exc)[:220])
+            return
+        assigned_server_set = set(assigned_server_ids)
+        cleared_server_ids = [server_id for server_id in unassigned_servers if server_id not in assigned_server_set]
+        if cleared_server_ids:
+            unassigned_servers[:] = [server_id for server_id in unassigned_servers if server_id in assigned_server_set]
+            self.store.save(self.state)
+            for server_id in cleared_server_ids:
+                LOGGER.info("server_report_resumed server_id=%s reason=assignment_removed", server_id)
+        server_ids = sorted(set(server_ids) & assigned_server_set)
         for server_id in server_ids:
+            if server_id in unassigned_servers:
+                continue
             cursor = cursors.get(server_id)
             if cursor is not None and (not isinstance(cursor, str) or not LOG_TIMESTAMP_RE.fullmatch(cursor)):
                 raise AgentError("saved runtime log cursor is invalid")
@@ -846,10 +875,30 @@ class RuntimeNodeAgent:
             except HttpStatusError as exc:
                 if exc.status == 401:
                     raise
+                if exc.status == 404:
+                    unassigned_servers.append(server_id)
+                    self.store.save(self.state)
+                    LOGGER.warning("server_report_suppressed server_id=%s reason=not_assigned", server_id)
+                    continue
                 LOGGER.warning("server_report_rejected server_id=%s status=%d", server_id, exc.status)
             except (AgentError, DockerError, OSError, TimeoutError) as exc:
                 LOGGER.warning("server_report_failed server_id=%s error=%s", server_id, str(exc)[:220])
                 continue
+
+    def _unassigned_server_ids(self) -> list[str]:
+        assert self.state is not None
+        server_ids = self.state.setdefault("unassigned_servers", [])
+        if (not isinstance(server_ids, list)
+                or any(not isinstance(server_id, str) or not UUID_RE.fullmatch(server_id) for server_id in server_ids)):
+            raise AgentError("saved unassigned server state is invalid")
+        return server_ids
+
+    def _clear_unassigned_server(self, server_id: str) -> None:
+        unassigned_servers = self._unassigned_server_ids()
+        if server_id in unassigned_servers:
+            unassigned_servers.remove(server_id)
+            self.store.save(self.state)
+            LOGGER.info("server_report_resumed server_id=%s reason=command_received", server_id)
 
     def _assigned_server_ids(self) -> list[str]:
         output = self.runtime._run(["docker", "ps", "--all", "--filter", "label=craftpilot.managed=1",

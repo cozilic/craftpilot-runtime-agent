@@ -544,6 +544,106 @@ class DockerRuntimeTests(unittest.TestCase):
             runtime._container_logs(CONTAINER_NAME, "not-a-timestamp")
 
 
+    def test_runtime_agent_reports_only_servers_currently_assigned_by_master(self):
+        class FakeRuntime:
+            config = self.config
+
+            def _run(self, *_args, **_kwargs):
+                return ""
+
+        state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 1}
+        store = SimpleNamespace(save=lambda _current: None)
+        agent = RuntimeNodeAgent(self.config, runtime=FakeRuntime(), store=store)
+        agent.state = state
+        assignment_snapshots = iter([[SERVER_ID], [SERVER_ID], [SERVER_ID]])
+        agent._assigned_server_ids = lambda: next(assignment_snapshots)
+        report_calls = []
+        agent._server_report = lambda server_id, *_args: report_calls.append(server_id) or {
+            "server_id": server_id, "sequence": 2, "status": "OFFLINE", "logs": [],
+        }
+        requests = []
+
+        def request(method, path, body, credential=False):
+            requests.append((method, path, credential))
+            if path.endswith("/servers"):
+                return {"servers": []}
+            raise AssertionError(f"Unexpected telemetry request: {path}")
+
+        agent._request = request
+        agent._report_servers(2)
+
+        self.assertEqual([], report_calls)
+        self.assertEqual([("GET", f"/api/runtime/nodes/{self.config.node_id}/servers", True)], requests)
+
+    def test_runtime_agent_skips_all_telemetry_if_assignment_fetch_fails(self):
+        class FakeRuntime:
+            config = self.config
+
+            def _run(self, *_args, **_kwargs):
+                return ""
+
+        state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 1}
+        agent = RuntimeNodeAgent(
+            self.config, runtime=FakeRuntime(), store=SimpleNamespace(save=lambda _current: None),
+        )
+        agent.state = state
+        agent._assigned_server_ids = lambda: [SERVER_ID]
+        reports = []
+        agent._server_report = lambda *args: reports.append(args)
+        agent._request = lambda *_args, **_kwargs: (_ for _ in ()).throw(agent_module.HttpStatusError(503))
+
+        with self.assertLogs("craftpilot.runtime_agent", level="WARNING"):
+            agent._report_servers(2)
+
+        self.assertEqual([], reports)
+
+    def test_404_server_report_is_suppressed_until_master_assignment_changes(self):
+        class FakeRuntime:
+            config = self.config
+
+            def _run(self, *_args, **_kwargs):
+                return ""
+
+        state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 1}
+        saved = []
+        store = SimpleNamespace(save=lambda current: saved.append(json.loads(json.dumps(current))))
+        agent = RuntimeNodeAgent(self.config, runtime=FakeRuntime(), store=store)
+        agent.state = state
+        assignment_snapshots = iter([[SERVER_ID], [SERVER_ID], [SERVER_ID]])
+        agent._assigned_server_ids = lambda: next(assignment_snapshots)
+        report_calls = []
+        agent._server_report = lambda server_id, *_args: report_calls.append(server_id) or {
+            "server_id": server_id, "sequence": 2, "status": "OFFLINE", "logs": [],
+        }
+        responses = iter([
+            {"servers": [SERVER_ID]}, agent_module.HttpStatusError(404),
+            {"servers": [SERVER_ID]}, {"servers": []},
+        ])
+        def request(method, path, *_args, **_kwargs):
+            response = next(responses)
+            if isinstance(response, agent_module.HttpStatusError):
+                raise response
+            return response
+
+        agent._request = request
+
+        with self.assertLogs("craftpilot.runtime_agent", level="INFO") as captured:
+            agent._report_servers(2)
+            agent._report_servers(3)
+
+        self.assertEqual([SERVER_ID], report_calls)
+        self.assertIn(SERVER_ID, state["unassigned_servers"])
+        self.assertTrue(any("server_report_suppressed" in message and SERVER_ID in message for message in captured.output))
+        agent._server_report = lambda server_id, sequence, *_args: {
+            "server_id": server_id, "sequence": sequence, "status": "OFFLINE", "logs": [],
+        }
+        agent._request = lambda method, path, *_args, **_kwargs: (
+            {"servers": []} if path.endswith("/servers") else {"ok": True}
+        )
+        agent._assigned_server_ids = lambda: [SERVER_ID]
+        agent._report_servers(4)
+        self.assertNotIn(SERVER_ID, state["unassigned_servers"])
+
     def test_server_report_classifies_clean_exit_as_offline_and_nonzero_exit_as_crashed(self):
         labels = json.dumps({"craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID})
 
