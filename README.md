@@ -4,7 +4,7 @@ The agent is an early runtime slice for remote CraftPilot nodes. It supports aut
 
 ## Requirements and security
 
-- A trusted, dedicated Linux host with Docker Engine and Docker Compose v2.
+- A trusted, dedicated Linux host with Docker Engine and Docker Compose. The setup supports the recommended `docker compose` plugin (Compose v2) and the legacy standalone `docker-compose` command.
 - HTTPS access from the node to the CraftPilot master.
 - The local Docker daemon must manage both this agent and the Minecraft containers. The configured server-data host directory must be visible at the same path to the daemon.
 - The Docker socket (`/var/run/docker.sock`) gives effectively host-root access. The Compose service mounts it so the agent can create and manage allowlisted server containers; run only on a trusted host and never expose the socket over TCP.
@@ -18,15 +18,16 @@ On a trusted Linux node, start the agent and it will request enrollment from Cra
 git clone https://github.com/cozilic/craftpilot-runtime-agent.git
 cd craftpilot-runtime-agent
 sh setup.sh
+# If your host only has the legacy standalone command, replace `docker compose` with `docker-compose`.
 docker compose up -d --build
 docker compose logs -f runtime-agent
 ```
 
-`sh setup.sh` copies `.env.example` to a private `.env` file (mode `600`), detects `DOCKER_GID` from `/var/run/docker.sock`, prepares `/srv/craftpilot/servers` with the Minecraft runtime group (default GID 33), and validates the resolved Compose configuration. Running it through `sh` avoids depending on the executable bit being preserved by Git, ZIP downloads, or the host filesystem. It preserves any existing `.env` settings and only updates `DOCKER_GID`. If directory ownership changes require it, the script asks `sudo` for permission; alternatively run it as root. Review `.env` before starting if the host uses a different server-data path or group.
+`sh setup.sh` checks for Docker Engine and Compose. If either is missing, it identifies the distribution from `/etc/os-release` and offers to install Docker's official Engine and Compose packages on supported Debian, Ubuntu, Fedora, RHEL 8–10, and CentOS Stream 9–10 systems. It does not add repositories or install packages without interactive confirmation. Unsupported distributions receive links to the official manual instructions. It then copies `.env.example` to a private `.env` file (mode `600`), detects `DOCKER_GID` from `/var/run/docker.sock`, prepares `/srv/craftpilot/servers` with the Minecraft runtime group (default GID 33), detects either the `docker compose` plugin or standalone `docker-compose`, and validates the resolved Compose configuration. The Compose file uses syntax supported by Compose v1.29 and newer; use Compose v2+ if available, since v1 is legacy. Running it through `sh` avoids depending on the executable bit being preserved by Git, ZIP downloads, or the host filesystem. It preserves any existing `.env` settings and only updates `DOCKER_GID`. If directory ownership changes require it, the script asks `sudo` for permission; alternatively run it as root. Review `.env` before starting if the host uses a different server-data path or group.
 
 The Compose file builds the current checkout and persists the enrollment request and, after approval, the agent credential and heartbeat sequence in the `agent_state` volume. The agent displays its request ID in logs; Sysadmin → Ops & log → Runtime nodes shows pending requests. Once approved, it fetches its identity automatically and appears online. For the default `/srv/craftpilot/servers` path, both the agent and each server container use that same bind-mounted host directory; `CRAFTPILOT_DOCKER_SERVER_DATA_ROOT` configures the path passed to the Docker daemon. The initial data directory and staged snapshot directories use the configured data GID (default 33) and setgid. Compose gives the agent a `0002` umask so new files created during later work remain group-writable. After enrollment succeeds, the agent saves its long-lived credential with restrictive permissions; protect and back up the `agent_state` volume as a secret. Use only one agent and state volume per node. If state is lost, ask a sysadmin to disable/re-enroll the node rather than copying credentials.
 
-To install an updated agent revision, pull the desired repository branch or tag and run `docker compose up -d --build`. Check compatibility with the CraftPilot master before upgrading.
+To install an updated agent revision, pull the desired repository branch or tag and run `docker compose up -d --build` (or `docker-compose up -d --build` on hosts with the standalone command). Check compatibility with the CraftPilot master before upgrading.
 
 ## Configuration
 
@@ -41,9 +42,11 @@ Optional agent variables (set in `.env` if needed):
 - `CRAFTPILOT_STOP_GRACE_SECONDS`: graceful stop timeout 0–45; default 30.
 - `CRAFTPILOT_LOG_LEVEL`: standard Python log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`); default `INFO`.
 
-The agent writes timestamped structured lifecycle logs to stderr, available with `docker compose logs -f runtime-agent`. At the default `INFO` level it records command IDs/types and server IDs, snapshot staging, container creation/start, console command delivery, graceful/forced stop requests, stop completion, status transitions, and command failures. Console command text, credentials, and RCON passwords are never logged. Set `CRAFTPILOT_LOG_LEVEL=DEBUG` for Python diagnostic detail; `DEBUG` does not currently add payload or secret logging.
+The agent writes timestamped structured lifecycle logs to stderr, available with `docker compose logs -f runtime-agent` (or `docker-compose logs -f runtime-agent` when using the standalone command). At the default `INFO` level it records command IDs/types and server IDs, snapshot staging, container creation/start, console command delivery, graceful/forced stop requests, stop completion, status transitions, and command failures. Console command text, credentials, and RCON passwords are never logged. Set `CRAFTPILOT_LOG_LEVEL=DEBUG` for Python diagnostic detail; `DEBUG` does not currently add payload or secret logging.
 
-For self-enrollment, no registration token is required. The agent creates a unique, expiring request secret, stores it with private permissions, and polls over HTTPS until the sysadmin approves or denies it. Approval creates an identity and credential for this single node; the agent saves that credential before acknowledging approval. Keep `.env` private and never commit it. The Compose build uses the code in the clone; publishing a GHCR image is a separate release step and is not required for this setup. To stop the agent, use `docker compose down`; this preserves its named state volume and server data. Do not run `docker compose down -v` unless you intend to delete the saved agent credentials/state.
+If you prefer to install Docker manually, follow Docker's official distribution instructions: https://docs.docker.com/engine/install/ . Compose is installed separately via https://docs.docker.com/compose/install/linux/ . Then verify with `docker --version` and `docker compose version`. If your host only has the legacy standalone `docker-compose` CLI, the setup supports it as well; use `docker-compose` instead of `docker compose` for start/logs/stop commands.
+
+For self-enrollment, no registration token is required. The agent creates a unique, expiring request secret, stores it with private permissions, and polls over HTTPS until the sysadmin approves or denies it. Approval creates an identity and credential for this single node; the agent saves that credential before acknowledging approval. Keep `.env` private and never commit it. The Compose build uses the code in the clone; publishing a GHCR image is a separate release step and is not required for this setup. To stop the agent, use `docker compose down` (or `docker-compose down`); this preserves its named state volume and server data. Do not run `docker compose down -v` / `docker-compose down -v` unless you intend to delete the saved agent credentials/state.
 
 ## Runtime and safety boundaries
 
