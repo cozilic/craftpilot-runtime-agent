@@ -348,7 +348,7 @@ class DockerRuntime:
                 file.write("\n".join(updated) + "\n")
                 file.flush()
                 os.fsync(file.fileno())
-            os.chmod(temporary, original_mode & 0o640 or 0o640)
+            os.chmod(temporary, (original_mode & 0o600) | 0o660)
             os.replace(temporary, properties)
             self.state_store.save(self.state)
         finally:
@@ -420,8 +420,16 @@ class DockerRuntime:
         if force:
             self._run(["docker", "kill", "--signal=KILL", name], timeout=15)
         else:
-            self._run(["docker", "stop", "--time", str(self.config.stop_grace_seconds), name],
-                      timeout=self.config.stop_grace_seconds + 15)
+            self._send_rcon(server_id, name, "stop")
+            deadline = time.monotonic() + self.config.stop_grace_seconds + 15
+            while time.monotonic() < deadline:
+                state = self._inspect(name, "{{.State.Status}}")
+                if state == "exited":
+                    return {"success": True, "result_code": "STOPPED"}
+                if state in (None, "dead"):
+                    raise DockerError("server container disappeared during graceful stop")
+                time.sleep(0.5)
+            raise DockerError("Minecraft did not finish graceful shutdown before the stop timeout")
         if self._inspect(name, "{{.State.Running}}") == "true":
             raise DockerError("container is still running after stop")
         return {"success": True, "result_code": "STOPPED"}
@@ -751,10 +759,35 @@ class RuntimeNodeAgent:
         if (not isinstance(command_id, str) or not UUID_RE.fullmatch(command_id) or not isinstance(lease_token, str)
                 or len(lease_token) != 64 or command_type not in ("start", "stop", "snapshot", "console") or not isinstance(payload, dict)):
             raise AgentError("master returned an invalid leased command")
+        if command_type == "start":
+            server_id = payload.get("server_id")
+            if isinstance(server_id, str) and UUID_RE.fullmatch(server_id):
+                stopped_servers = self.state.setdefault("intentional_stops", {})
+                if not isinstance(stopped_servers, dict) or any(
+                    not isinstance(key, str) or not UUID_RE.fullmatch(key)
+                    or not isinstance(value, str) or not UUID_RE.fullmatch(value)
+                    for key, value in stopped_servers.items()
+                ):
+                    raise AgentError("saved intentional stop state is invalid")
+                if stopped_servers.pop(server_id, None) is not None:
+                    self.store.save(self.state)
         try:
             result = self.runtime.execute(command_type, payload, credential=self.state["credential"], command_id=command_id)
         except (AgentError, DockerError) as exc:
             result = {"success": False, "result_code": "RUNTIME_ERROR", "message": str(exc)[:300]}
+        if command_type in ("start", "stop") and result.get("success"):
+            server_id = payload.get("server_id")
+            if isinstance(server_id, str) and UUID_RE.fullmatch(server_id):
+                stopped_servers = self.state.setdefault("intentional_stops", {})
+                if not isinstance(stopped_servers, dict) or any(
+                    not isinstance(key, str) or not UUID_RE.fullmatch(key)
+                    or not isinstance(value, str) or not UUID_RE.fullmatch(value)
+                    for key, value in stopped_servers.items()
+                ):
+                    raise AgentError("saved intentional stop state is invalid")
+                if command_type == "stop":
+                    stopped_servers[server_id] = command_id
+                    self.store.save(self.state)
         self._request("POST", f"/api/runtime/nodes/{self.config.node_id}/commands/{command_id}/ack",
                       {"lease_token": lease_token, **result}, credential=True)
         self._report_servers(sequence)
@@ -816,9 +849,22 @@ class RuntimeNodeAgent:
             return None
         self.runtime._verify_managed(server_id, name)
         state = self.runtime._inspect(name, "{{.State.Status}}")
-        if state == "exited":
-            exit_code = self.runtime._inspect(name, "{{.State.ExitCode}}")
-            status = "CRASHED" if exit_code not in ("0", None) else "OFFLINE"
+        intentional_stops = self.state.get("intentional_stops", {}) if self.state is not None else {}
+        if not isinstance(intentional_stops, dict) or any(
+            not isinstance(key, str) or not UUID_RE.fullmatch(key)
+            or not isinstance(value, str) or not UUID_RE.fullmatch(value)
+            for key, value in intentional_stops.items()
+        ):
+            raise AgentError("saved intentional stop state is invalid")
+        if state == "running" and running == "true" and server_id in intentional_stops:
+            intentional_stops.pop(server_id)
+            if self.state is not None:
+                self.store.save(self.state)
+        if state in ("exited", "dead"):
+            exit_code = self.runtime._inspect(name, "{{.State.ExitCode}}") if state == "exited" else None
+            status = "OFFLINE" if server_id in intentional_stops or (
+                state == "exited" and exit_code in ("0", None)
+            ) else "CRASHED"
         else:
             status = {"running": "ONLINE", "created": "STARTING", "restarting": "STARTING",
                       "paused": "STOPPING", "dead": "CRASHED"}.get(state or "", "ERROR")

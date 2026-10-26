@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -400,6 +401,8 @@ class DockerRuntimeTests(unittest.TestCase):
         self.assertIn(f"rcon.password={first_password}", content)
         self.assertIn("motd=Keep this", content)
         self.assertGreaterEqual(len(store.saved), 2)
+        if os.name != "nt":
+            self.assertNotEqual(0, properties.stat().st_mode & 0o020, "Minecraft's shared group must be able to save server.properties")
 
     def test_start_refuses_missing_rcon_state_before_creating_container(self):
         (self.config.data_root / SERVER_ID / "existing.txt").unlink()
@@ -538,6 +541,80 @@ class DockerRuntimeTests(unittest.TestCase):
             runtime._container_logs(CONTAINER_NAME, "not-a-timestamp")
 
 
+    def test_server_report_classifies_clean_exit_as_offline_and_nonzero_exit_as_crashed(self):
+        labels = json.dumps({"craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID})
+
+        for exit_code, expected_status in (("0", "OFFLINE"), ("137", "CRASHED")):
+            with self.subTest(exit_code=exit_code):
+                runner = FakeDocker(["false", labels, "exited", exit_code, "2026-10-26T10:00:00Z|0|123"])
+                agent = RuntimeNodeAgent(self.config, runtime=DockerRuntime(self.config, runner))
+                agent.state = {"sequence": 1, "intentional_stops": {}}
+
+                report = agent._server_report(SERVER_ID, 9)
+
+                self.assertEqual(expected_status, report["status"])
+
+    def test_successful_stop_command_persists_stop_intent_before_acknowledgment(self):
+        command_id = "63473593-e3d4-4f12-8778-73a54ef93d98"
+        calls = []
+        state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 1}
+        store = SimpleNamespace(save=lambda saved: calls.append(("save", json.loads(json.dumps(saved)))))
+        agent = RuntimeNodeAgent(self.config, runtime=SimpleNamespace(execute=lambda *_args, **_kwargs: {
+            "success": True, "result_code": "STOPPED",
+        }), store=store)
+        agent.state = state
+
+        def request(_method, path, _body, credential=False):
+            calls.append(("request", path))
+            if path.endswith("/commands/claim"):
+                return {"command": {
+                    "id": command_id, "lease_token": "l" * 64, "type": "stop", "payload": {"server_id": SERVER_ID},
+                }}
+            return {"ok": True}
+
+        agent._request = request
+
+        def observe_report(_sequence):
+            self.assertEqual({SERVER_ID: command_id}, state["intentional_stops"])
+
+        agent._report_servers = observe_report
+        agent.poll_once()
+
+        self.assertEqual({SERVER_ID: command_id}, state["intentional_stops"])
+        saved_index = next(index for index, call in enumerate(calls)
+                           if call[0] == "save" and call[1].get("intentional_stops") == {SERVER_ID: command_id})
+        ack_index = next(index for index, call in enumerate(calls)
+                         if call[0] == "request" and call[1].endswith(f"/commands/{command_id}/ack"))
+        self.assertLess(saved_index, ack_index)
+
+    def test_running_report_clears_old_intentional_stop(self):
+        labels = json.dumps({"craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID})
+        runner = FakeDocker(["true", labels, "running", "2026-10-26T10:00:00Z|0|123"])
+        store = SimpleNamespace(save=lambda _state: None)
+        runtime = DockerRuntime(self.config, runner)
+        agent = RuntimeNodeAgent(self.config, runtime=runtime, store=store)
+        agent.state = {"sequence": 1, "intentional_stops": {SERVER_ID: "63473593-e3d4-4f12-8778-73a54ef93d98"}}
+        runtime.state = agent.state
+
+        report = agent._server_report(SERVER_ID, 9)
+
+        self.assertEqual("ONLINE", report["status"])
+        self.assertNotIn(SERVER_ID, agent.state["intentional_stops"])
+
+    def test_server_report_does_not_mark_acknowledged_graceful_stop_as_crashed(self):
+        labels = json.dumps({"craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID})
+        runner = FakeDocker(["false", labels, "exited", "137", "2026-10-26T10:00:00Z|0|123"])
+        store = SimpleNamespace(save=lambda state: None)
+        runtime = DockerRuntime(self.config, runner)
+        agent = RuntimeNodeAgent(self.config, runtime=runtime, store=store)
+        agent.state = {"sequence": 1, "intentional_stops": {SERVER_ID: "63473593-e3d4-4f12-8778-73a54ef93d98"}}
+        runtime.state = agent.state
+
+        report = agent._server_report(SERVER_ID, 9)
+
+        self.assertEqual("OFFLINE", report["status"])
+        self.assertIn(SERVER_ID, agent.state["intentional_stops"])
+
     def test_server_report_keeps_status_when_stats_or_logs_fail(self):
         labels = json.dumps({"craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID})
 
@@ -569,16 +646,21 @@ class DockerRuntimeTests(unittest.TestCase):
             DockerRuntime(self.config, runner).execute("stop", {"server_id": SERVER_ID, "force": False})
         self.assertFalse(any(call[:2] == ["docker", "stop"] for call in runner.calls))
 
-    def test_stop_uses_graceful_docker_stop(self):
+    def test_stop_uses_minecraft_graceful_stop_and_waits_for_container_exit(self):
         labels = json.dumps({"craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID})
-        runner = FakeDocker(["true", labels, "false"])
+        runner = FakeDocker(["true", labels, "running", "exited"])
+        runtime = DockerRuntime(self.config, runner)
+        rcon_commands = []
+        runtime._send_rcon = lambda _server_id, _name, command: rcon_commands.append(command)
 
-        result = DockerRuntime(self.config, runner).execute("stop", {"server_id": SERVER_ID, "force": False})
+        with patch.object(agent_module.time, "sleep", return_value=None) as sleep:
+            result = runtime.execute("stop", {"server_id": SERVER_ID, "force": False})
 
         self.assertEqual("STOPPED", result["result_code"])
-        stop_call = next(call for call in runner.calls if call[:2] == ["docker", "stop"])
-        self.assertIn("--time", stop_call)
-        self.assertNotIn("--signal=KILL", stop_call)
+        self.assertEqual(["stop"], rcon_commands)
+        self.assertEqual(1, sleep.call_count)
+        self.assertFalse(any(call[:2] == ["docker", "stop"] for call in runner.calls))
+        self.assertFalse(any(call[:2] == ["docker", "kill"] for call in runner.calls))
 
     def test_command_cannot_choose_a_container_name(self):
         payload = {"server_id": SERVER_ID, "container": make_spec(self.config)}
