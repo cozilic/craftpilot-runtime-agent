@@ -70,6 +70,14 @@ class FakeDocker:
             return SimpleNamespace(returncode=0, stdout=value + "\n", stderr="")
         if args[:3] == ["docker", "network", "inspect"]:
             return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+        if args[:3] == ["docker", "network", "connect"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if args[:3] == ["docker", "stats", "--no-stream"]:
+            return SimpleNamespace(returncode=0, stdout="12.5%|512MiB / 2GiB\n", stderr="")
+        if args[:2] == ["docker", "logs"]:
+            return SimpleNamespace(returncode=0, stdout="2026-10-26T10:00:00.000000000Z [Server thread/INFO]: ready\n", stderr="")
+        if args[:2] == ["du", "-sb"]:
+            return SimpleNamespace(returncode=0, stdout="10485760\t/data\n", stderr="")
         if args[:3] == ["docker", "run", "--detach"]:
             return SimpleNamespace(returncode=0, stdout=self.run_output + "\n", stderr="")
         if args[:2] == ["docker", "start"]:
@@ -134,6 +142,14 @@ class EnrollmentTests(unittest.TestCase):
         with self.assertRaisesRegex(AgentError, "rejected"):
             self.agent.poll_enrollment_once()
         self.assertIsNone(self.agent.state)
+
+
+class MemoryStateStore:
+    def __init__(self):
+        self.saved: list[dict[str, object]] = []
+
+    def save(self, state):
+        self.saved.append(json.loads(json.dumps(state)))
 
 
 class DockerRuntimeTests(unittest.TestCase):
@@ -342,18 +358,57 @@ class DockerRuntimeTests(unittest.TestCase):
 
     def test_start_creates_only_expected_container_with_limits_and_labels(self):
         (self.config.data_root / SERVER_ID / "existing.txt").unlink()
+        (self.config.data_root / SERVER_ID / "server.properties").write_text("motd=Test\nenable-rcon=false\n")
         runner = FakeDocker(["__missing__", "true", "b" * 64])
         runtime = DockerRuntime(self.config, runner)
+        runtime.state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 0}
+        runtime.state_store = MemoryStateStore()
 
         result = runtime.execute("start", {"server_id": SERVER_ID, "container": make_spec(self.config)})
 
         self.assertEqual("STARTED", result["result_code"])
+        properties = (self.config.data_root / SERVER_ID / "server.properties").read_text()
+        self.assertIn("enable-rcon=true", properties)
+        self.assertIn("rcon.port=25575", properties)
+        self.assertIn("rcon.ip=0.0.0.0", properties)
+        self.assertRegex(properties, r"rcon.password=[a-f0-9]{64}")
         docker_run = next(call for call in runner.calls if call[:3] == ["docker", "run", "--detach"])
         self.assertIn("--memory", docker_run)
         self.assertIn("--cpus", docker_run)
         self.assertIn("--restart", docker_run)
         self.assertIn("craftpilot.server_id=" + SERVER_ID, docker_run)
         self.assertIn("eclipse-temurin:21-jre", docker_run)
+
+    def test_rcon_settings_use_persistent_private_password_and_atomic_properties_write(self):
+        properties = self.config.data_root / SERVER_ID / "server.properties"
+        properties.write_text("motd=Keep this\nenable-rcon=false\nenable-rcon=false\nrcon.port=25575\n")
+        store = MemoryStateStore()
+        self.runtime.state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 1}
+        self.runtime.state_store = store
+
+        self.runtime._ensure_rcon(SERVER_ID)
+        first_password = self.runtime.state["rcon_passwords"][SERVER_ID]
+        self.runtime._ensure_rcon(SERVER_ID)
+        content = properties.read_text()
+
+        self.assertEqual(first_password, self.runtime.state["rcon_passwords"][SERVER_ID])
+        self.assertEqual(1, content.count("enable-rcon="))
+        self.assertIn("enable-rcon=true", content)
+        self.assertIn("rcon.port=25575", content)
+        self.assertIn("rcon.ip=0.0.0.0", content)
+        self.assertEqual(1, content.count("rcon.password="))
+        self.assertIn(f"rcon.password={first_password}", content)
+        self.assertIn("motd=Keep this", content)
+        self.assertGreaterEqual(len(store.saved), 2)
+
+    def test_start_refuses_missing_rcon_state_before_creating_container(self):
+        (self.config.data_root / SERVER_ID / "existing.txt").unlink()
+        (self.config.data_root / SERVER_ID / "server.properties").write_text("motd=Test\n")
+        runner = FakeDocker(["__missing__"])
+
+        with self.assertRaisesRegex(AgentError, "RCON state"):
+            DockerRuntime(self.config, runner).execute("start", {"server_id": SERVER_ID, "container": make_spec(self.config)})
+        self.assertFalse(any(call[:3] == ["docker", "run", "--detach"] for call in runner.calls))
 
     def test_docker_server_data_path_can_be_overridden_for_desktop_daemon(self):
         self.config = Config(
@@ -365,13 +420,22 @@ class DockerRuntimeTests(unittest.TestCase):
             images=frozenset({"eclipse-temurin:21-jre"}),
             docker_data_root="C:/CraftPilot/runtime-data",
         )
-        result = DockerRuntime(self.config, FakeDocker(["__missing__", "true", "b" * 64])).execute(
+        (self.config.data_root / SERVER_ID / "server.properties").write_text("motd=Test\n")
+        state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 0}
+        runner = FakeDocker(["__missing__", "true", "b" * 64])
+        result_runtime = DockerRuntime(self.config, runner)
+        result_runtime.state = state
+        result_runtime.state_store = MemoryStateStore()
+        result = result_runtime.execute(
             "start", {"server_id": SERVER_ID, "container": make_spec(self.config)},
         )
         self.assertEqual("STARTED", result["result_code"])
-        runtime = DockerRuntime(self.config, FakeDocker(["__missing__", "true", "b" * 64]))
+        runtime_runner = FakeDocker(["__missing__", "true", "b" * 64])
+        runtime = DockerRuntime(self.config, runtime_runner)
+        runtime.state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 0}
+        runtime.state_store = MemoryStateStore()
         runtime.execute("start", {"server_id": SERVER_ID, "container": make_spec(self.config)})
-        docker_run = next(call for call in runtime.runner.calls if call[:3] == ["docker", "run", "--detach"])
+        docker_run = next(call for call in runtime_runner.calls if call[:3] == ["docker", "run", "--detach"])
         self.assertIn("C:/CraftPilot/runtime-data/" + SERVER_ID + ":/data:rw", docker_run)
 
     def test_start_refuses_unallowlisted_image_before_invoking_docker_run(self):
@@ -398,6 +462,105 @@ class DockerRuntimeTests(unittest.TestCase):
         with self.assertRaises(AgentError):
             DockerRuntime(self.config, runner).execute("start", {"server_id": SERVER_ID, "container": make_spec(self.config)})
         self.assertFalse(any(call[:3] == ["docker", "run", "--detach"] for call in runner.calls))
+
+    def test_console_validates_container_ownership_and_rejects_line_breaks(self):
+        runtime = DockerRuntime(self.config, FakeDocker(["true", json.dumps({
+            "craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID,
+        })]))
+        runtime.state = {"rcon_passwords": {SERVER_ID: "a" * 64}}
+        runtime._send_rcon = lambda *_args: None
+        result = runtime.execute("console", {"server_id": SERVER_ID, "command": "list"})
+        self.assertEqual("CONSOLE_EXECUTED", result["result_code"])
+        self.assertEqual(hashlib.sha256(b"list").hexdigest(), result["message"])
+
+        for command in ("", "say\nstop", "say\rstop", "say\x00stop", "x" * 16385):
+            with self.subTest(command=repr(command)):
+                with self.assertRaises(AgentError):
+                    runtime.execute("console", {"server_id": SERVER_ID, "command": command})
+
+    def test_console_refuses_foreign_container_and_offline_state(self):
+        foreign = DockerRuntime(self.config, FakeDocker(["true", json.dumps({
+            "craftpilot.managed": "1", "craftpilot.server_id": "00000000-0000-0000-0000-000000000000",
+        })]))
+        with self.assertRaises(AgentError):
+            foreign.execute("console", {"server_id": SERVER_ID, "command": "list"})
+
+        offline = DockerRuntime(self.config, FakeDocker(["false"]))
+        with self.assertRaisesRegex(AgentError, "not running"):
+            offline.execute("console", {"server_id": SERVER_ID, "command": "list"})
+
+    def test_server_metrics_parse_docker_units_and_tolerate_bad_stats(self):
+        self.assertEqual((12.5, 512, 2048), RuntimeNodeAgent._parse_docker_stats("12.5%|512MiB / 2GiB"))
+        self.assertEqual((None, None, None), RuntimeNodeAgent._parse_docker_stats("not available"))
+        self.assertEqual(1536, RuntimeNodeAgent._parse_size_mb("1.5 GiB"))
+        self.assertEqual(1, RuntimeNodeAgent._parse_size_mb("1 MB"))
+        self.assertIsNone(RuntimeNodeAgent._parse_size_mb("unknown"))
+
+    def test_server_report_returns_status_metrics_logs_and_data_disk_usage(self):
+        (self.config.data_root / SERVER_ID / "existing.txt").write_text("x" * 100)
+        labels = json.dumps({"craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID})
+        from datetime import datetime, timedelta, timezone
+        start = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+        runner = FakeDocker([
+            "true", labels, "running", start, "10485760\t/data\n",
+            "2026-10-26T10:00:00.000000000Z [Server thread/INFO]: ready",
+        ])
+        runtime = DockerRuntime(self.config, runner)
+        report = RuntimeNodeAgent(self.config, runtime=runtime)._server_report(SERVER_ID, 7)
+
+        self.assertEqual("ONLINE", report["status"])
+        self.assertEqual(12.5, report["cpu_percent"])
+        self.assertEqual(512, report["memory_used_mb"])
+        self.assertEqual(2048, report["memory_limit_mb"])
+        self.assertIsInstance(report["uptime_seconds"], int)
+        self.assertGreaterEqual(report["disk_used_mb"], 0)
+        self.assertEqual("[Server thread/INFO]: ready", report["logs"][0]["text"])
+        self.assertIsNone(report["players_online"])
+        log_call = next(call for call in runner.calls if call[:2] == ["docker", "logs"])
+        self.assertIn("--timestamps", log_call)
+        self.assertIn("--tail", log_call)
+
+    def test_container_logs_merge_both_streams_filter_timestamp_and_reject_bad_cursor(self):
+        runner = FakeDocker([])
+        runtime = DockerRuntime(self.config, runner)
+        output = (
+            "2026-10-26T10:00:02Z stdout-later\n"
+            "2026-10-26T10:00:01Z stdout-earlier\n"
+            "not-a-timestamp invalid\n"
+        )
+        stderr = "2026-10-26T10:00:03Z stderr-error\n"
+        runtime.runner = lambda _args, **_kwargs: SimpleNamespace(returncode=0, stdout=output, stderr=stderr)
+
+        logs = runtime._container_logs(CONTAINER_NAME, "2026-10-26T10:00:01+00:00")
+
+        self.assertEqual(["stdout-later", "stderr-error"], [line["text"] for line in logs])
+        with self.assertRaisesRegex(AgentError, "cursor"):
+            runtime._container_logs(CONTAINER_NAME, "not-a-timestamp")
+
+
+    def test_server_report_keeps_status_when_stats_or_logs_fail(self):
+        labels = json.dumps({"craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID})
+
+        class PartiallyFailingDocker(FakeDocker):
+            def __call__(self, args, **kwargs):
+                self.calls.append(list(args))
+                if args[:3] == ["docker", "inspect", "--format"]:
+                    value = self.inspect_values.pop(0)
+                    return SimpleNamespace(returncode=0, stdout=value + "\n", stderr="")
+                if args[:3] == ["docker", "stats", "--no-stream"] or args[:2] == ["docker", "logs"]:
+                    return SimpleNamespace(returncode=1, stdout="", stderr="Docker unavailable")
+                if args[:2] == ["du", "-sb"]:
+                    return SimpleNamespace(returncode=1, stdout="", stderr="du unavailable")
+                raise AssertionError(args)
+
+        runner = PartiallyFailingDocker(["true", labels, "running", "2026-10-26T10:00:00Z|0|123"])
+        report = RuntimeNodeAgent(self.config, runtime=DockerRuntime(self.config, runner))._server_report(SERVER_ID, 8)
+
+        self.assertEqual("ONLINE", report["status"])
+        self.assertIsNone(report["cpu_percent"])
+        self.assertIsNone(report["memory_used_mb"])
+        self.assertEqual([], report["logs"])
+        self.assertIsNone(report["disk_used_mb"])
 
     def test_stop_refuses_container_with_foreign_labels(self):
         runner = FakeDocker(["true", json.dumps({"craftpilot.managed": "1", "craftpilot.server_id": "other"})])

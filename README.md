@@ -1,6 +1,6 @@
 # CraftPilot Linux runtime-node agent
 
-The agent is an early runtime slice for remote CraftPilot nodes. It supports authenticated initial server `SNAPSHOT` staging and fixed Minecraft container `START`/`STOP` operations. It does not synchronize or migrate existing worlds, relay logs/console/stats, provide remote file operations, or establish end-to-end connectivity by itself. The node operator must configure firewall access to server ports and ensure the CraftPilot Gate host can reach the node's advertised public address.
+The agent is an early runtime slice for remote CraftPilot nodes. It supports authenticated initial server `SNAPSHOT` staging, fixed Minecraft container `START`/`STOP`/`CONSOLE` operations, and sequenced status/resource/log telemetry. It does not synchronize or migrate existing worlds, provide remote file operations, or establish end-to-end connectivity by itself. The node operator must configure firewall access to server ports and ensure the CraftPilot Gate host can reach the node's advertised public address.
 
 ## Requirements and security
 
@@ -44,7 +44,10 @@ For self-enrollment, no registration token is required. The agent creates a uniq
 
 ## Runtime and safety boundaries
 
-- Only fixed `snapshot`, `start` and `stop` operations are supported; no arbitrary host-shell command is exposed.
+- Only fixed `snapshot`, `start`, `stop` and `console` operations are supported; console commands are sent over authenticated RCON, never interpolated into a host-shell command.
+- For console support, the agent persists a random per-server RCON password in its private state volume, updates `server.properties` atomically, and connects only to the container's IPv4 address on the configured isolated Docker network. RCON is not published to the host; the agent is attached to that private network. Protect the state volume as a secret because it contains both the node credential and RCON passwords.
+- After claiming/acknowledging a command, the agent reports each matching managed container's state, Docker CPU/memory usage, uptime, server-data disk usage and at most 100 timestamped log lines. Log cursors are kept in agent state and advance only after the master accepts the report. Docker stats/log collection failures leave status reporting available and do not stop the polling loop. The master rejects stale/replayed reports, treats stale node/report pairs as unavailable, broadcasts accepted console/player changes and keeps bounded log history on disk.
+- RCON and telemetry have been covered by Docker-free agent and master feature tests. Test actual command delivery, server log output, restart-persistent RCON credentials and firewall/proxy reachability on a disposable Linux Docker node before production use.
 - Containers are named from server UUIDs and are reused/stopped only if CraftPilot ownership labels match. Images must exactly match the local allowlist; resource limits, port, user, network, mount point and data paths are validated.
 - Initial snapshots are downloaded only from the configured HTTPS master origin with the node credential; byte count and SHA-256 are verified. ZIP traversal, symlinks, special files, and excessive decompression are rejected. Files are extracted to a temporary directory and installed only into a missing or empty destination; populated destinations are never overwritten.
 - Docker socket access remains privileged. Restrict host access, enrollment credentials, token file, and agent state accordingly. HTTPS redirects are not followed and certificate verification is not disabled.
