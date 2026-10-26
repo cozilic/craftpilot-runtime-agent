@@ -144,6 +144,110 @@ class EnrollmentTests(unittest.TestCase):
             self.agent.poll_enrollment_once()
         self.assertIsNone(self.agent.state)
 
+    def test_revoked_credential_stays_inert_until_operator_supplies_fresh_token(self):
+        node_id = "9f4a2d91-728a-4e9e-a4a2-a580f263da67"
+        credential = "c" * 64
+        self.config = Config(
+            master_url=self.config.master_url,
+            node_id=node_id,
+            registration_token=None,
+            state_dir=self.config.state_dir,
+            data_root=self.config.data_root,
+            images=self.config.images,
+        )
+        self.agent = RuntimeNodeAgent(
+            self.config, runtime=SimpleNamespace(config=self.config), store=agent_module.StateStore(self.config.state_dir),
+        )
+        self.agent.state = {"node_id": node_id, "credential": credential, "sequence": 7}
+
+        self.agent._mark_credential_revoked()
+        self.assertTrue(self.agent.credential_revoked)
+        self.assertIsNone(self.agent.state)
+        self.assertEqual({"node_id": node_id, "credential_revoked": True}, self.agent.store.load())
+
+        calls = []
+        self.agent._request = lambda *args, **kwargs: calls.append(args) or self.fail("must not enroll without an operator-provided token")
+        self.assertFalse(self.agent.ensure_registered())
+        self.assertTrue(self.agent.credential_revoked)
+        self.assertIsNone(self.agent.state)
+        self.assertEqual([], calls)
+
+        token = "t" * 64
+        self.agent.config = Config(
+            master_url=self.config.master_url,
+            node_id=node_id,
+            registration_token=token,
+            state_dir=self.config.state_dir,
+            data_root=self.config.data_root,
+            images=self.config.images,
+        )
+        self.agent.runtime.config = self.agent.config
+
+        def request(method, path, body, credential=False):
+            calls.append((method, path, body, credential))
+            return {"node_id": node_id, "credential": "n" * 64, "master_url": self.config.master_url}
+
+        self.agent._request = request
+        self.assertTrue(self.agent.ensure_registered())
+        self.assertFalse(self.agent.credential_revoked)
+        self.assertEqual("n" * 64, self.agent.state["credential"])
+        self.assertEqual(1, len(calls))
+        self.assertEqual("/api/runtime/nodes/%s/register" % node_id, calls[0][1])
+        self.assertEqual(token, calls[0][2]["registration_token"])
+        self.assertIsNone(self.agent.config.registration_token)
+        self.assertNotIn("credential_revoked", self.agent.store.load())
+
+    def test_revoked_credential_waits_when_no_fresh_registration_token_is_available(self):
+        node_id = "9f4a2d91-728a-4e9e-a4a2-a580f263da67"
+        self.agent.store.save({"node_id": node_id, "credential_revoked": True})
+        calls = []
+        self.agent._request = lambda *args, **kwargs: calls.append(args) or self.fail("must not register without a token")
+
+        self.assertFalse(self.agent.ensure_registered())
+        self.assertTrue(self.agent.credential_revoked)
+        self.assertEqual([], calls)
+        self.assertEqual({"node_id": node_id, "credential_revoked": True}, self.agent.store.load())
+
+    def test_revoked_credential_keeps_waiting_when_registration_token_is_stale(self):
+        node_id = "9f4a2d91-728a-4e9e-a4a2-a580f263da67"
+        config = Config(
+            master_url=self.config.master_url,
+            node_id=node_id,
+            registration_token="t" * 64,
+            state_dir=self.config.state_dir,
+            data_root=self.config.data_root,
+            images=self.config.images,
+        )
+        self.agent = RuntimeNodeAgent(config, runtime=SimpleNamespace(config=config), store=self.agent.store)
+        self.agent.store.save({"node_id": node_id, "credential_revoked": True})
+        calls = []
+
+        def unauthorized(*_args, **_kwargs):
+            calls.append("attempt")
+            raise agent_module.HttpStatusError(401)
+
+        self.agent._request = unauthorized
+        self.assertFalse(self.agent.ensure_registered())
+        self.assertTrue(self.agent.credential_revoked)
+        self.assertIsNone(self.agent.state)
+        self.assertEqual(["attempt"], calls)
+        self.assertEqual({"node_id": node_id, "credential_revoked": True}, self.agent.store.load())
+
+    def test_only_401_from_authenticated_requests_is_a_revoked_credential(self):
+        self.agent.state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 1}
+        self.agent._opener = SimpleNamespace(open=lambda *_args, **_kwargs: self.fail("expected HTTP error"))
+        request = agent_module.urllib.request.Request("https://master.example/api/runtime/nodes/test/heartbeat")
+
+        for authenticated, expected in ((True, agent_module.CredentialRejectedError),
+                                        (False, agent_module.HttpStatusError)):
+            with self.subTest(authenticated=authenticated):
+                def raise_unauthorized(*_args, **_kwargs):
+                    raise agent_module.urllib.error.HTTPError(request.full_url, 401, "unauthorized", {}, None)
+
+                self.agent._opener.open = raise_unauthorized
+                with self.assertRaises(expected):
+                    self.agent._request("POST", "/api/runtime/nodes/test/heartbeat", {}, credential=authenticated)
+
 
 class MemoryStateStore:
     def __init__(self):
@@ -151,6 +255,27 @@ class MemoryStateStore:
 
     def save(self, state):
         self.saved.append(json.loads(json.dumps(state)))
+
+
+class RuntimeAgentRevocationTests(unittest.TestCase):
+    def test_run_forever_does_not_poll_or_exit_after_credential_revocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_config(Path(directory))
+            agent = RuntimeNodeAgent(config, runtime=SimpleNamespace(config=config), store=MemoryStateStore())
+            calls = []
+            agent.ensure_registered = lambda: True
+            agent.poll_once = lambda: (_ for _ in ()).throw(agent_module.CredentialRejectedError(401))
+            agent._mark_credential_revoked = lambda: (setattr(agent, "credential_revoked", True), calls.append("revoked"))
+
+            def sleep(_delay):
+                calls.append("sleep")
+                raise KeyboardInterrupt
+
+            with patch.object(agent_module.time, "sleep", side_effect=sleep):
+                with self.assertRaises(KeyboardInterrupt):
+                    agent.run_forever()
+
+            self.assertEqual(["revoked", "sleep"], calls)
 
 
 class DockerRuntimeTests(unittest.TestCase):

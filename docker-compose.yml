@@ -18,6 +18,7 @@ services:
     environment:
       CRAFTPILOT_MASTER_URL: ${CRAFTPILOT_MASTER_URL:-https://craftpilot.se}
       CRAFTPILOT_NODE_ID: ${CRAFTPILOT_NODE_ID:-}
+      CRAFTPILOT_REGISTRATION_TOKEN: ${CRAFTPILOT_REGISTRATION_TOKEN:-}
       CRAFTPILOT_AGENT_STATE_DIR: /var/lib/craftpilot-agent
       CRAFTPILOT_SERVER_DATA_ROOT: /srv/craftpilot/servers
       # The Docker daemon must see this exact host path for child server mounts.

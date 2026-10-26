@@ -51,6 +51,10 @@ class HttpStatusError(AgentError):
         self.status = status
 
 
+class CredentialRejectedError(HttpStatusError):
+    """The master rejected this node's long-lived credential."""
+
+
 class DockerError(AgentError):
     pass
 
@@ -800,11 +804,15 @@ class RuntimeNodeAgent:
         self.state: dict[str, Any] | None = None
         self._opener = urllib.request.build_opener(_NoRedirectHandler())
         self._last_reported_states: dict[str, str] = {}
+        self.pending_enrollment: dict[str, str] | None = None
+        self.credential_revoked = False
         if isinstance(self.runtime, DockerRuntime):
             self.runtime.state_store = self.store
 
     def ensure_registered(self) -> bool:
         state = self.store.load()
+        if state is not None and state.get("credential_revoked") is True:
+            return self._resume_revoked_node(state)
         if state is not None and state.get("enrollment_request_id") and not state.get("credential"):
             request_id, request_secret = state.get("enrollment_request_id"), state.get("enrollment_request_secret")
             if not isinstance(request_id, str) or not UUID_RE.fullmatch(request_id) or not isinstance(request_secret, str) or not re.fullmatch(r"[A-Za-z0-9]{64}", request_secret):
@@ -841,9 +849,74 @@ class RuntimeNodeAgent:
             if isinstance(self.runtime, DockerRuntime):
                 self.runtime.state = self.state
             self.store.save(self.state)
-            os.environ.pop("CRAFTPILOT_REGISTRATION_TOKEN", None)
+            self._clear_registration_token()
             return True
         return self._request_dynamic_enrollment()
+
+    def _resume_revoked_node(self, saved_state: dict[str, Any]) -> bool:
+        node_id = saved_state.get("node_id")
+        if not isinstance(node_id, str) or not UUID_RE.fullmatch(node_id):
+            raise AgentError("saved revoked-node state is invalid")
+        if self.config.node_id is not None and self.config.node_id != node_id:
+            raise AgentError("saved revoked-node state does not match the configured node")
+        self._set_node_id(node_id)
+        self.state = None
+        self.pending_enrollment = None
+        self.credential_revoked = True
+        if isinstance(self.runtime, DockerRuntime):
+            self.runtime.state = None
+
+        token = self.config.registration_token
+        if token is None or not 32 <= len(token) <= 128:
+            return False
+
+        try:
+            result = self._request("POST", f"/api/runtime/nodes/{node_id}/register",
+                                   {"registration_token": token})
+        except HttpStatusError as exc:
+            if exc.status != 401:
+                raise
+            LOGGER.warning("runtime_agent_reenrollment_token_rejected node_id=%s; waiting for a fresh token", node_id)
+            return False
+        except AgentError as exc:
+            LOGGER.warning("runtime_agent_reenrollment_failed node_id=%s error=%s", node_id, str(exc)[:220])
+            return False
+
+        credential = result.get("credential")
+        if result.get("node_id") != node_id or not isinstance(credential, str) or not re.fullmatch(r"[A-Za-z0-9]{64}", credential):
+            raise AgentError("master returned an invalid registration response")
+        master_url = result.get("master_url", self.config.master_url)
+        if not isinstance(master_url, str) or master_url.rstrip("/") != self.config.master_url:
+            raise AgentError("registration response master URL does not match configured HTTPS origin")
+
+        self.state = {"node_id": node_id, "credential": credential, "sequence": 0}
+        if isinstance(self.runtime, DockerRuntime):
+            self.runtime.state = self.state
+        self.store.save(self.state)
+        self.credential_revoked = False
+        self._clear_registration_token()
+        LOGGER.info("runtime_agent_online node_id=%s", node_id)
+        return True
+
+    def _clear_registration_token(self) -> None:
+        from dataclasses import replace
+        self.config = replace(self.config, registration_token=None)
+        self.runtime.config = self.config
+        os.environ.pop("CRAFTPILOT_REGISTRATION_TOKEN", None)
+
+    def _mark_credential_revoked(self) -> None:
+        node_id = self.config.node_id
+        if self.state is not None:
+            node_id = self.state.get("node_id", node_id)
+        if isinstance(node_id, str) and UUID_RE.fullmatch(node_id):
+            self.store.save({"node_id": node_id, "credential_revoked": True})
+        self.state = None
+        self.pending_enrollment = None
+        if isinstance(self.runtime, DockerRuntime):
+            self.runtime.state = None
+        self.credential_revoked = True
+        LOGGER.error("runtime_agent_credential_revoked node_id=%s action=waiting_for_manual_reenrollment",
+                     node_id or "unknown")
 
     def _set_node_id(self, node_id: str) -> None:
         from dataclasses import replace
@@ -1219,24 +1292,25 @@ class RuntimeNodeAgent:
         while True:
             started = time.monotonic()
             try:
-                if self.state is None:
+                if self.credential_revoked or self.state is None:
                     self.ensure_registered()
-                if self.state is not None and self.state.get("enrollment_request_id"):
-                    if self.poll_enrollment_once():
-                        LOGGER.info("runtime_agent_online node_id=%s", self.config.node_id)
-                else:
-                    self.poll_once()
+                if not self.credential_revoked:
+                    if self.state is not None and self.state.get("enrollment_request_id"):
+                        if self.poll_enrollment_once():
+                            LOGGER.info("runtime_agent_online node_id=%s", self.config.node_id)
+                    else:
+                        self.poll_once()
+            except CredentialRejectedError:
+                self._mark_credential_revoked()
             except HttpStatusError as exc:
-                if exc.status == 401:
-                    raise AgentError("node credential was rejected or revoked; re-enroll the node") from exc
                 if exc.status == 409:
                     LOGGER.warning("heartbeat_lease_conflict retrying_with_new_sequence")
                 else:
                     LOGGER.warning("master_request_failed status=%d retrying", exc.status)
             except (AgentError, OSError, TimeoutError) as exc:
                 LOGGER.error("agent_iteration_failed error=%s", str(exc)[:300])
-            delay = max(0.0, (15 if self.state is None or self.state.get("enrollment_request_id") else self.config.poll_seconds)
-                        - (time.monotonic() - started))
+            delay = max(0.0, (15 if self.credential_revoked or self.state is None or self.state.get("enrollment_request_id")
+                              else self.config.poll_seconds) - (time.monotonic() - started))
             time.sleep(delay)
 
     def _request(self, method: str, path: str, body: dict[str, Any], credential: bool = False) -> dict[str, Any]:
@@ -1255,7 +1329,11 @@ class RuntimeNodeAgent:
                     raise HttpStatusError(response.status)
                 raw = response.read(1024 * 1024 + 1)
         except urllib.error.HTTPError as exc:
-            raise HttpStatusError(exc.code) from None
+            status = exc.code
+            exc.close()
+            if credential and status == 401:
+                raise CredentialRejectedError(status) from None
+            raise HttpStatusError(status) from None
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise AgentError("could not reach the CraftPilot master") from exc
         if len(raw) > 1024 * 1024:
