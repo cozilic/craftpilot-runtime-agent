@@ -39,6 +39,9 @@ Optional agent variables (set in `.env` if needed):
 - `CRAFTPILOT_ALLOWED_IMAGES`: comma-separated exact image allowlist. Defaults to Temurin JRE 8, 11, 17, 21 and 25 images.
 - `CRAFTPILOT_POLL_SECONDS`: polling interval 5–120; default 30.
 - `CRAFTPILOT_STOP_GRACE_SECONDS`: graceful stop timeout 0–45; default 30.
+- `CRAFTPILOT_LOG_LEVEL`: standard Python log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`); default `INFO`.
+
+The agent writes timestamped structured lifecycle logs to stderr, available with `docker compose logs -f runtime-agent`. At the default `INFO` level it records command IDs/types and server IDs, snapshot staging, container creation/start, console command delivery, graceful/forced stop requests, stop completion, status transitions, and command failures. Console command text, credentials, and RCON passwords are never logged. Set `CRAFTPILOT_LOG_LEVEL=DEBUG` for Python diagnostic detail; `DEBUG` does not currently add payload or secret logging.
 
 For self-enrollment, no registration token is required. The agent creates a unique, expiring request secret, stores it with private permissions, and polls over HTTPS until the sysadmin approves or denies it. Approval creates an identity and credential for this single node; the agent saves that credential before acknowledging approval. Keep `.env` private and never commit it. The Compose build uses the code in the clone; publishing a GHCR image is a separate release step and is not required for this setup. To stop the agent, use `docker compose down`; this preserves its named state volume and server data. Do not run `docker compose down -v` unless you intend to delete the saved agent credentials/state.
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -30,6 +31,8 @@ DOCKER_ID_RE = re.compile(r"^[0-9a-f]{12,64}$", re.I)
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 USER_RE = re.compile(r"^[0-9]{1,10}:[0-9]{1,10}$")
 LOG_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$")
+LOGGER = logging.getLogger("craftpilot.runtime_agent")
+
 DEFAULT_IMAGES = frozenset({
     "eclipse-temurin:8-jre", "eclipse-temurin:11-jre", "eclipse-temurin:17-jre",
     "eclipse-temurin:21-jre", "eclipse-temurin:25-jre",
@@ -241,6 +244,7 @@ class DockerRuntime:
                 destination.rmdir()
             _prepare_shared_server_directory(extract_path, self.config.data_gid)
             os.replace(extract_path, destination)
+            LOGGER.info("server_snapshot_staged server_id=%s bytes=%d files=%d", server_id, received, file_count)
             return {"success": True, "result_code": "SNAPSHOT_STAGED", "message": expected_sha256,
                     "container_id": str(expected_bytes)}
         finally:
@@ -251,6 +255,7 @@ class DockerRuntime:
         if existing is not None:
             self._verify_managed(server_id, name)
         if existing == "true":
+            LOGGER.info("server_start_noop server_id=%s reason=already_running", server_id)
             return {"success": True, "result_code": "ALREADY_RUNNING", "container_id": self._container_id(name)}
         self._server_data_path(server_id)
         self._ensure_network()
@@ -278,15 +283,18 @@ class DockerRuntime:
                     "--memory", f"{memory}m", "--memory-swap", f"{memory}m", "--cpus", cpus,
                     "--restart", "no", "--user", container_user, "--volume", f"{data_path}:/data:rw",
                     "--publish", f"{port}:25565/tcp", image, *command]
+            LOGGER.info("server_container_create_started server_id=%s image=%s port=%d", server_id, image, port)
             output = self._run(args, timeout=self.config.docker_timeout_seconds)
             candidate_id = output.strip().splitlines()[-1] if output.strip() else ""
             if candidate_id and not DOCKER_ID_RE.fullmatch(candidate_id):
                 raise DockerError("Docker returned an invalid container id")
         else:
             self._ensure_rcon(server_id)
+            LOGGER.info("server_container_start_requested server_id=%s", server_id)
             self._run(["docker", "start", name], timeout=self.config.docker_timeout_seconds)
         if self._inspect(name, "{{.State.Running}}") != "true":
             raise DockerError("container did not remain running after start")
+        LOGGER.info("server_started server_id=%s", server_id)
         return {"success": True, "result_code": "STARTED", "container_id": self._container_id(name)}
 
     def _console(self, server_id: str, name: str, command: Any) -> dict[str, Any]:
@@ -297,6 +305,7 @@ class DockerRuntime:
             raise AgentError("server container is not running")
         self._verify_managed(server_id, name)
         self._send_rcon(server_id, name, command)
+        LOGGER.info("server_console_command_sent server_id=%s", server_id)
         return {"success": True, "result_code": "CONSOLE_EXECUTED",
                 "message": hashlib.sha256(command.encode("utf-8")).hexdigest()}
 
@@ -411,20 +420,25 @@ class DockerRuntime:
     def _stop(self, server_id: str, name: str, force: bool) -> dict[str, Any]:
         running = self._inspect(name, "{{.State.Running}}")
         if running is None:
+            LOGGER.info("server_stop_noop server_id=%s reason=container_missing", server_id)
             return {"success": True, "result_code": "ALREADY_STOPPED"}
         self._verify_managed(server_id, name)
         if running == "false":
+            LOGGER.info("server_stop_noop server_id=%s reason=already_stopped", server_id)
             return {"success": True, "result_code": "ALREADY_STOPPED"}
         if running != "true":
             raise DockerError("Docker returned an invalid running state")
         if force:
+            LOGGER.warning("server_force_stop_requested server_id=%s", server_id)
             self._run(["docker", "kill", "--signal=KILL", name], timeout=15)
         else:
+            LOGGER.info("server_graceful_stop_requested server_id=%s", server_id)
             self._send_rcon(server_id, name, "stop")
             deadline = time.monotonic() + self.config.stop_grace_seconds + 15
             while time.monotonic() < deadline:
                 state = self._inspect(name, "{{.State.Status}}")
                 if state == "exited":
+                    LOGGER.info("server_stopped server_id=%s method=graceful", server_id)
                     return {"success": True, "result_code": "STOPPED"}
                 if state in (None, "dead"):
                     raise DockerError("server container disappeared during graceful stop")
@@ -432,6 +446,7 @@ class DockerRuntime:
             raise DockerError("Minecraft did not finish graceful shutdown before the stop timeout")
         if self._inspect(name, "{{.State.Running}}") == "true":
             raise DockerError("container is still running after stop")
+        LOGGER.info("server_stopped server_id=%s method=force", server_id)
         return {"success": True, "result_code": "STOPPED"}
 
     def _server_data_path(self, server_id: str) -> Path:
@@ -623,6 +638,7 @@ class RuntimeNodeAgent:
         self.store = store or StateStore(config.state_dir)
         self.state: dict[str, Any] | None = None
         self._opener = urllib.request.build_opener(_NoRedirectHandler())
+        self._last_reported_states: dict[str, str] = {}
         if isinstance(self.runtime, DockerRuntime):
             self.runtime.state_store = self.store
 
@@ -682,7 +698,7 @@ class RuntimeNodeAgent:
             raise AgentError("master returned an invalid enrollment request")
         self.pending_enrollment = {"request_id": request_id, "request_secret": request_secret}
         self.store.save({"node_id": None, "enrollment_request_id": request_id, "enrollment_request_secret": request_secret})
-        print(f"Enrollment request {request_id} is waiting for sysadmin approval.", file=sys.stderr)
+        LOGGER.info("enrollment_waiting request_id=%s", request_id)
         return False
 
     def poll_enrollment_once(self) -> bool:
@@ -759,6 +775,10 @@ class RuntimeNodeAgent:
         if (not isinstance(command_id, str) or not UUID_RE.fullmatch(command_id) or not isinstance(lease_token, str)
                 or len(lease_token) != 64 or command_type not in ("start", "stop", "snapshot", "console") or not isinstance(payload, dict)):
             raise AgentError("master returned an invalid leased command")
+        command_server_id = payload.get("server_id")
+        if not isinstance(command_server_id, str) or not UUID_RE.fullmatch(command_server_id):
+            command_server_id = "invalid"
+        LOGGER.info("command_received command_id=%s type=%s server_id=%s", command_id, command_type, command_server_id)
         if command_type == "start":
             server_id = payload.get("server_id")
             if isinstance(server_id, str) and UUID_RE.fullmatch(server_id):
@@ -774,6 +794,8 @@ class RuntimeNodeAgent:
         try:
             result = self.runtime.execute(command_type, payload, credential=self.state["credential"], command_id=command_id)
         except (AgentError, DockerError) as exc:
+            LOGGER.error("command_execution_failed command_id=%s type=%s server_id=%s error=%s",
+                         command_id, command_type, command_server_id, str(exc)[:300])
             result = {"success": False, "result_code": "RUNTIME_ERROR", "message": str(exc)[:300]}
         if command_type in ("start", "stop") and result.get("success"):
             server_id = payload.get("server_id")
@@ -790,6 +812,9 @@ class RuntimeNodeAgent:
                     self.store.save(self.state)
         self._request("POST", f"/api/runtime/nodes/{self.config.node_id}/commands/{command_id}/ack",
                       {"lease_token": lease_token, **result}, credential=True)
+        if result.get("success"):
+            LOGGER.info("command_completed command_id=%s type=%s server_id=%s result=%s",
+                        command_id, command_type, command_server_id, result.get("result_code", "unknown"))
         self._report_servers(sequence)
 
     def _report_servers(self, sequence: int) -> None:
@@ -810,13 +835,20 @@ class RuntimeNodeAgent:
                 if report is None:
                     continue
                 self._request("POST", f"/api/runtime/nodes/{self.config.node_id}/servers/report", report, credential=True)
+                previous_status = self._last_reported_states.get(server_id)
+                if report["status"] != previous_status:
+                    LOGGER.info("server_status_reported server_id=%s previous=%s current=%s",
+                                server_id, previous_status or "unknown", report["status"])
+                    self._last_reported_states[server_id] = report["status"]
                 if report["logs"]:
                     cursors[server_id] = report["logs"][-1]["ts"]
                     self.store.save(self.state)
             except HttpStatusError as exc:
                 if exc.status == 401:
                     raise
-            except (AgentError, DockerError, OSError, TimeoutError):
+                LOGGER.warning("server_report_rejected server_id=%s status=%d", server_id, exc.status)
+            except (AgentError, DockerError, OSError, TimeoutError) as exc:
+                LOGGER.warning("server_report_failed server_id=%s error=%s", server_id, str(exc)[:220])
                 continue
 
     def _assigned_server_ids(self) -> list[str]:
@@ -969,7 +1001,7 @@ class RuntimeNodeAgent:
 
     def run_forever(self) -> None:
         if self.ensure_registered():
-            print(f"CraftPilot runtime agent for node {self.config.node_id} is online.", file=sys.stderr)
+            LOGGER.info("runtime_agent_online node_id=%s", self.config.node_id)
         while True:
             started = time.monotonic()
             try:
@@ -977,18 +1009,18 @@ class RuntimeNodeAgent:
                     self.ensure_registered()
                 if self.state is not None and self.state.get("enrollment_request_id"):
                     if self.poll_enrollment_once():
-                        print(f"CraftPilot runtime agent for node {self.config.node_id} is online.", file=sys.stderr)
+                        LOGGER.info("runtime_agent_online node_id=%s", self.config.node_id)
                 else:
                     self.poll_once()
             except HttpStatusError as exc:
                 if exc.status == 401:
                     raise AgentError("node credential was rejected or revoked; re-enroll the node") from exc
                 if exc.status == 409:
-                    print("Heartbeat/lease conflict; retrying with a new sequence.", file=sys.stderr)
+                    LOGGER.warning("heartbeat_lease_conflict retrying_with_new_sequence")
                 else:
-                    print(f"Master request failed ({exc.status}); retrying.", file=sys.stderr)
+                    LOGGER.warning("master_request_failed status=%d retrying", exc.status)
             except (AgentError, OSError, TimeoutError) as exc:
-                print(f"Agent iteration failed: {str(exc)[:300]}", file=sys.stderr)
+                LOGGER.error("agent_iteration_failed error=%s", str(exc)[:300])
             delay = max(0.0, (15 if self.state is None or self.state.get("enrollment_request_id") else self.config.poll_seconds)
                         - (time.monotonic() - started))
             time.sleep(delay)
@@ -1029,6 +1061,11 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def main() -> int:
+    logging.basicConfig(
+        level=os.environ.get("CRAFTPILOT_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        stream=sys.stderr,
+    )
     try:
         config = Config.from_env()
         config.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1041,10 +1078,10 @@ def main() -> int:
             except BlockingIOError as exc:
                 raise AgentError("another agent process already holds the state lock") from exc
             signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-            print(f"CraftPilot runtime agent started{f' for node {config.node_id}' if config.node_id else ''}.", file=sys.stderr)
+            LOGGER.info("runtime_agent_started node_id=%s", config.node_id or "pending_enrollment")
             RuntimeNodeAgent(config).run_forever()
     except AgentError as exc:
-        print(f"CraftPilot runtime agent: {exc}", file=sys.stderr)
+        LOGGER.error("runtime_agent_fatal error=%s", exc)
         return 1
     except KeyboardInterrupt:
         return 0

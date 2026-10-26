@@ -365,9 +365,12 @@ class DockerRuntimeTests(unittest.TestCase):
         runtime.state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 0}
         runtime.state_store = MemoryStateStore()
 
-        result = runtime.execute("start", {"server_id": SERVER_ID, "container": make_spec(self.config)})
+        with self.assertLogs("craftpilot.runtime_agent", level="INFO") as captured:
+            result = runtime.execute("start", {"server_id": SERVER_ID, "container": make_spec(self.config)})
 
         self.assertEqual("STARTED", result["result_code"])
+        self.assertTrue(any("server_container_create_started" in message for message in captured.output))
+        self.assertTrue(any("server_started" in message for message in captured.output))
         properties = (self.config.data_root / SERVER_ID / "server.properties").read_text()
         self.assertIn("enable-rcon=true", properties)
         self.assertIn("rcon.port=25575", properties)
@@ -578,8 +581,11 @@ class DockerRuntimeTests(unittest.TestCase):
             self.assertEqual({SERVER_ID: command_id}, state["intentional_stops"])
 
         agent._report_servers = observe_report
-        agent.poll_once()
+        with self.assertLogs("craftpilot.runtime_agent", level="INFO") as captured:
+            agent.poll_once()
 
+        self.assertTrue(any("command_received" in message and command_id in message for message in captured.output))
+        self.assertTrue(any("command_completed" in message and "result=STOPPED" in message for message in captured.output))
         self.assertEqual({SERVER_ID: command_id}, state["intentional_stops"])
         saved_index = next(index for index, call in enumerate(calls)
                            if call[0] == "save" and call[1].get("intentional_stops") == {SERVER_ID: command_id})
@@ -653,9 +659,12 @@ class DockerRuntimeTests(unittest.TestCase):
         rcon_commands = []
         runtime._send_rcon = lambda _server_id, _name, command: rcon_commands.append(command)
 
-        with patch.object(agent_module.time, "sleep", return_value=None) as sleep:
-            result = runtime.execute("stop", {"server_id": SERVER_ID, "force": False})
+        with self.assertLogs("craftpilot.runtime_agent", level="INFO") as captured:
+            with patch.object(agent_module.time, "sleep", return_value=None) as sleep:
+                result = runtime.execute("stop", {"server_id": SERVER_ID, "force": False})
 
+        self.assertTrue(any("server_graceful_stop_requested" in message for message in captured.output))
+        self.assertTrue(any("server_stopped" in message for message in captured.output))
         self.assertEqual("STOPPED", result["result_code"])
         self.assertEqual(["stop"], rcon_commands)
         self.assertEqual(1, sleep.call_count)

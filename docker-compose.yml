@@ -24,6 +24,7 @@ services:
       CRAFTPILOT_DOCKER_SERVER_DATA_ROOT: ${CRAFTPILOT_SERVER_DATA_HOST_PATH:-/srv/craftpilot/servers}
       CRAFTPILOT_SERVER_DATA_GID: ${CRAFTPILOT_SERVER_DATA_GID:-33}
       CRAFTPILOT_DOCKER_NETWORK: ${CRAFTPILOT_DOCKER_NETWORK:-craftpilot-servers}
+      CRAFTPILOT_LOG_LEVEL: ${CRAFTPILOT_LOG_LEVEL:-INFO}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - agent_state:/var/lib/craftpilot-agent
