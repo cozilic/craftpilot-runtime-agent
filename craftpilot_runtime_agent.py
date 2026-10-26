@@ -22,6 +22,8 @@ import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass
+
+import migration_transfer
 from pathlib import Path
 from typing import Any
 
@@ -161,6 +163,8 @@ class DockerRuntime:
             return self._stop(server_id, expected_name, force)
         if command_type == "console":
             return self._console(server_id, expected_name, payload.get("command"))
+        if command_type in ("migration_prepare", "migration_stop", "migration_export", "migration_import", "migration_commit", "migration_delete_source"):
+            return self._migration(command_type, server_id, expected_name, payload, credential)
         raise AgentError("unsupported command type")
 
     def _stage_snapshot(self, server_id: str, payload: dict[str, Any], credential: str | None,
@@ -249,6 +253,163 @@ class DockerRuntime:
                     "container_id": str(expected_bytes)}
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+
+    def _migration_request(self, method: str, path: str, body: bytes | dict[str, Any] | None = None,
+                           content_type: str = "application/json", command_id: str | None = None,
+                           lease_token: str | None = None) -> dict[str, Any] | bytes:
+        if not path.startswith("/api/runtime/nodes/") or ".." in path:
+            raise AgentError("invalid migration API path")
+        assert self.state is not None
+        headers = {"Accept": "application/json, application/octet-stream",
+                   "Authorization": f"Bearer {self.state['credential']}"}
+        if command_id is not None or lease_token is not None:
+            if (not isinstance(command_id, str) or not UUID_RE.fullmatch(command_id)
+                    or not isinstance(lease_token, str) or not re.fullmatch(r"[A-Za-z0-9]{64}", lease_token)):
+                raise AgentError("migration relay lease is invalid")
+            headers["X-Migration-Command"] = command_id
+            headers["X-Migration-Lease"] = lease_token
+        data: bytes | None
+        if isinstance(body, dict):
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        else:
+            if body is not None:
+                headers["Content-Type"] = content_type
+            data = body
+        request = urllib.request.Request(self.config.master_url + path, data=data, headers=headers, method=method)
+        try:
+            with self._opener.open(request, timeout=60) as response:
+                if not 200 <= response.status < 300:
+                    raise HttpStatusError(response.status)
+                raw = response.read(migration_transfer.CHUNK_BYTES + 65536)
+        except urllib.error.HTTPError as exc:
+            raise HttpStatusError(exc.code) from None
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise AgentError("could not relay migration data through the CraftPilot master") from exc
+        if response.headers.get_content_type() == "application/octet-stream":
+            if len(raw) > migration_transfer.CHUNK_BYTES + 16:
+                raise AgentError("relayed migration chunk exceeded the size limit")
+            return raw
+        if len(raw) > 1024 * 1024:
+            raise AgentError("migration metadata exceeded the size limit")
+        try:
+            decoded = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise AgentError("master returned invalid migration metadata") from exc
+        if not isinstance(decoded, dict):
+            raise AgentError("migration metadata response must be a JSON object")
+        return decoded
+
+    def _migration(self, command_type: str, server_id: str, container_name: str,
+                   payload: dict[str, Any], credential: str | None) -> dict[str, Any]:
+        migration_id = payload.get("migration_id")
+        transfer_command_id = payload.get("_migration_command_id")
+        transfer_lease_token = payload.get("_migration_lease_token")
+        if (not isinstance(transfer_command_id, str) or not UUID_RE.fullmatch(transfer_command_id)
+                or not isinstance(transfer_lease_token, str) or not re.fullmatch(r"[A-Za-z0-9]{64}", transfer_lease_token)):
+            raise AgentError("migration transfer lease is invalid")
+        source_node_id = payload.get("source_node_id")
+        destination_node_id = payload.get("destination_node_id")
+        if (not isinstance(migration_id, str) or not UUID_RE.fullmatch(migration_id)
+                or not isinstance(source_node_id, str) or not UUID_RE.fullmatch(source_node_id)
+                or not isinstance(destination_node_id, str) or not UUID_RE.fullmatch(destination_node_id)
+                or source_node_id == destination_node_id):
+            raise AgentError("migration command has invalid node or migration identifiers")
+        if command_type == "migration_prepare":
+            if self.config.node_id != destination_node_id or self.state is None or self.state_store is None:
+                raise AgentError("migration key preparation is not addressed to this destination node")
+            keys = self.state.setdefault("migration_receiver_keys", {})
+            if not isinstance(keys, dict):
+                raise AgentError("saved migration receiver keys are invalid")
+            entry = keys.get(migration_id)
+            if not isinstance(entry, dict) or entry.get("server_id") != server_id:
+                private_key, public_key = migration_transfer.create_receiver_keypair()
+                entry = {"server_id": server_id, "private_key": private_key, "public_key": public_key}
+                keys[migration_id] = entry
+                self.state_store.save(self.state)
+            return {"success": True, "result_code": "MIGRATION_PREPARED", "message": entry["public_key"]}
+        if command_type == "migration_stop":
+            if self.config.node_id != source_node_id:
+                raise AgentError("migration stop is not addressed to this source node")
+            result = self._stop(server_id, container_name, False)
+            if result["result_code"] not in ("STOPPED", "ALREADY_STOPPED"):
+                raise AgentError("source server did not stop before migration")
+            return {"success": True, "result_code": "MIGRATION_STOPPED"}
+        if command_type == "migration_export":
+            if self.config.node_id != source_node_id or not isinstance(payload.get("destination_public_key"), str):
+                raise AgentError("migration export is not addressed to this source node")
+            def send_manifest(manifest: dict[str, object]) -> None:
+                result = self._migration_request("PUT", f"/api/runtime/nodes/{self.config.node_id}/migrations/{migration_id}/manifest", {
+                    **manifest, "server_id": server_id, "source_node_id": source_node_id,
+                    "destination_node_id": destination_node_id,
+                }, command_id=transfer_command_id, lease_token=transfer_lease_token)
+                if not isinstance(result, dict) or result.get("ok") is not True:
+                    raise AgentError("master did not accept the encrypted migration manifest")
+            def send_chunk(index: int, chunk: bytes) -> None:
+                result = self._migration_request("PUT", f"/api/runtime/nodes/{self.config.node_id}/migrations/{migration_id}/chunks/{index}", chunk,
+                                                 "application/octet-stream", transfer_command_id, transfer_lease_token)
+                if not isinstance(result, dict) or result.get("ok") is not True:
+                    raise AgentError("master did not accept an encrypted migration chunk")
+            result = migration_transfer.export_encrypted(
+                self._server_data_path(server_id), self.config.state_dir, migration_id,
+                source_node_id, destination_node_id, payload["destination_public_key"], send_manifest, send_chunk,
+            )
+            return {"success": True, "result_code": "MIGRATION_EXPORTED",
+                    "message": str(result["archive_sha256"]), "container_id": str(result["archive_bytes"])}
+        if command_type == "migration_import":
+            if self.config.node_id != destination_node_id:
+                raise AgentError("migration import is not addressed to this destination node")
+            state = self.state
+            keys = state.get("migration_receiver_keys") if state is not None else None
+            key_entry = keys.get(migration_id) if isinstance(keys, dict) else None
+            if not isinstance(key_entry, dict) or key_entry.get("server_id") != server_id or not isinstance(key_entry.get("private_key"), str):
+                raise AgentError("migration receiver key is unavailable")
+            result_manifest = self._migration_request(
+                "GET", f"/api/runtime/nodes/{self.config.node_id}/migrations/{migration_id}/manifest",
+                command_id=transfer_command_id, lease_token=transfer_lease_token,
+            )
+            if not isinstance(result_manifest, dict) or not isinstance(result_manifest.get("manifest"), dict):
+                raise AgentError("encrypted migration manifest is unavailable")
+            manifest = result_manifest["manifest"]
+            if (manifest.get("server_id") != server_id or manifest.get("source_node_id") != source_node_id
+                    or manifest.get("destination_node_id") != destination_node_id):
+                raise AgentError("encrypted migration manifest is addressed to different nodes or server")
+            def get_chunk(index: int) -> bytes:
+                value = self._migration_request(
+                    "GET", f"/api/runtime/nodes/{self.config.node_id}/migrations/{migration_id}/chunks/{index}",
+                    command_id=transfer_command_id, lease_token=transfer_lease_token,
+                )
+                if not isinstance(value, bytes):
+                    raise AgentError("master returned invalid migration ciphertext")
+                return value
+            result = migration_transfer.import_encrypted(
+                self.config.data_root, self.config.state_dir, migration_id, server_id,
+                source_node_id, destination_node_id, key_entry["private_key"],
+                manifest, get_chunk,
+            )
+            return {"success": True, "result_code": "MIGRATION_STAGED",
+                    "message": str(result["archive_sha256"]), "container_id": str(result["archive_bytes"])}
+        if command_type == "migration_commit":
+            if self.config.node_id != destination_node_id:
+                raise AgentError("migration commit is not addressed to this destination node")
+            migration_transfer.commit_staged(
+                self.config.data_root, self.config.state_dir, migration_id, server_id,
+                str(payload.get("archive_sha256", "")),
+            )
+            return {"success": True, "result_code": "MIGRATION_COMMITTED"}
+        if command_type == "migration_delete_source":
+            if self.config.node_id != source_node_id:
+                raise AgentError("migration source cleanup is not addressed to the source node")
+            if not isinstance(payload.get("archive_sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", payload["archive_sha256"]):
+                raise AgentError("migration cleanup lacks verified archive digest")
+            running = self._inspect(container_name, "{{.State.Running}}")
+            if running == "true":
+                raise AgentError("refusing to delete source data while the server container is running")
+            if running is not None:
+                self._verify_managed(server_id, container_name)
+            migration_transfer.delete_source(self.config.data_root, server_id)
+            return {"success": True, "result_code": "MIGRATION_SOURCE_DELETED"}
+        raise AgentError("unsupported migration operation")
 
     def _start(self, server_id: str, name: str, spec: dict[str, Any]) -> dict[str, Any]:
         existing = self._inspect(name, "{{.State.Running}}")
@@ -773,7 +934,7 @@ class RuntimeNodeAgent:
         command_id, lease_token = command.get("id"), command.get("lease_token")
         command_type, payload = command.get("type"), command.get("payload")
         if (not isinstance(command_id, str) or not UUID_RE.fullmatch(command_id) or not isinstance(lease_token, str)
-                or len(lease_token) != 64 or command_type not in ("start", "stop", "snapshot", "console") or not isinstance(payload, dict)):
+                or len(lease_token) != 64 or command_type not in ("start", "stop", "snapshot", "console", "migration_prepare", "migration_stop", "migration_export", "migration_import", "migration_commit", "migration_delete_source") or not isinstance(payload, dict)):
             raise AgentError("master returned an invalid leased command")
         command_server_id = payload.get("server_id")
         if not isinstance(command_server_id, str) or not UUID_RE.fullmatch(command_server_id):
@@ -794,6 +955,10 @@ class RuntimeNodeAgent:
                 if stopped_servers.pop(server_id, None) is not None:
                     self.store.save(self.state)
         try:
+            if command_type.startswith("migration_"):
+                payload = dict(payload)
+                payload["_migration_command_id"] = command_id
+                payload["_migration_lease_token"] = lease_token
             result = self.runtime.execute(command_type, payload, credential=self.state["credential"], command_id=command_id)
         except (AgentError, DockerError) as exc:
             LOGGER.error("command_execution_failed command_id=%s type=%s server_id=%s error=%s",
@@ -814,7 +979,7 @@ class RuntimeNodeAgent:
                     self.store.save(self.state)
         self._request("POST", f"/api/runtime/nodes/{self.config.node_id}/commands/{command_id}/ack",
                       {"lease_token": lease_token, **result}, credential=True)
-        if result.get("success") and command_type in ("start", "stop", "snapshot"):
+        if result.get("success") and command_type in ("start", "stop", "snapshot", "migration_export", "migration_import", "migration_commit", "migration_delete_source"):
             self._clear_unassigned_server(command_server_id)
         if result.get("success"):
             LOGGER.info("command_completed command_id=%s type=%s server_id=%s result=%s",

@@ -11,8 +11,15 @@ RUN apt-get update \
     && mkdir -p /var/lib/craftpilot-agent /srv/craftpilot/servers \
     && chown -R agent:agent /var/lib/craftpilot-agent /srv/craftpilot/servers
 
-WORKDIR /opt/craftpilot-runtime-agent
-COPY craftpilot_runtime_agent.py ./craftpilot_runtime_agent.py
+RUN python -m pip install --no-cache-dir --upgrade pip \
+    && python -m pip install --no-cache-dir cryptography==46.0.5 \
+    && python -c "import cryptography; assert cryptography.__version__ == '46.0.5'"
 
+WORKDIR /opt/craftpilot-runtime-agent
+COPY craftpilot_runtime_agent.py migration_transfer.py ./
+COPY test_migration_transfer.py ./
+RUN python -m unittest -q test_migration_transfer
+
+RUN rm test_migration_transfer.py
 USER agent
 CMD ["python", "/opt/craftpilot-runtime-agent/craftpilot_runtime_agent.py"]
