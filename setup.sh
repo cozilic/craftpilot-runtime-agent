@@ -43,6 +43,7 @@ case "$0" in
 esac
 SCRIPT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR" && pwd)
 cd "$SCRIPT_DIR"
+. "$SCRIPT_DIR/host_resource_checks.sh"
 
 if [ ! -r /etc/os-release ]; then
   echo "This setup script supports Linux distributions that provide /etc/os-release." >&2
@@ -461,6 +462,7 @@ if ! docker info >/dev/null 2>&1; then
   echo "Docker daemon is still unreachable by this user. Check service status and permissions for /var/run/docker.sock, then rerun setup.sh." >&2
   exit 1
 fi
+docker_memory_bytes=$(docker info --format '{{.MemTotal}}' 2>/dev/null || true)
 docker_server_version=$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)
 docker_server_version=${docker_server_version%%-*}
 docker_server_version=${docker_server_version%%+*}
@@ -594,6 +596,11 @@ if ! chmod 2770 "$SERVER_DATA_PATH" 2>/dev/null; then
     echo "Could not set permissions on $SERVER_DATA_PATH. Run setup as root or install sudo." >&2
     exit 1
   fi
+fi
+
+if ! check_host_resources /proc/meminfo "$SERVER_DATA_PATH" 4096 1024 10240 1024 "$docker_memory_bytes"; then
+  echo "Host resource preflight failed. Free memory or disk space before setting up a Minecraft runtime node." >&2
+  exit 1
 fi
 
 $COMPOSE config --quiet
