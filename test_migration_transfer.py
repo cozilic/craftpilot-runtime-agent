@@ -67,8 +67,22 @@ class MigrationTransferTests(unittest.TestCase):
         transfer.commit_staged(self.destination_root, self.destination_state, MIGRATION_ID, SERVER_ID,
                                str(self.metadata["archive_sha256"]))
 
-    def test_archive_refuses_files_the_runtime_agent_cannot_read(self) -> None:
+    def test_archive_uses_actual_file_read_not_advisory_access_check(self) -> None:
         with patch.object(transfer.os, "access", return_value=False):
+            archive_bytes, files, _digest = transfer._build_archive(self.source_root, self.root / "readable.zip")
+
+        self.assertGreater(archive_bytes, 0)
+        self.assertEqual(2, files)
+
+    def test_archive_refuses_files_the_runtime_agent_cannot_read(self) -> None:
+        original_write = zipfile.ZipFile.write
+
+        def reject_server_properties(archive, filename, *args, **kwargs):
+            if Path(filename).name == "server.properties":
+                raise PermissionError("permission denied")
+            return original_write(archive, filename, *args, **kwargs)
+
+        with patch.object(zipfile.ZipFile, "write", reject_server_properties):
             with self.assertRaisesRegex(transfer.MigrationTransferError, "cannot read"):
                 transfer._build_archive(self.source_root, self.root / "unreadable.zip")
 

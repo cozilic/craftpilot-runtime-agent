@@ -111,13 +111,18 @@ def _build_archive(server_root: Path, destination: Path) -> tuple[int, int, str]
                     raise MigrationTransferError("server data changed while being archived") from exc
                 if not stat.S_ISREG(info.st_mode):
                     raise MigrationTransferError("server data contains a symlink or special entry")
-                if not os.access(path, os.R_OK):
-                    raise MigrationTransferError("runtime agent cannot read a server data file")
+                # os.access() is affected by ACLs and platform-specific mount
+                # semantics; its advisory result can contradict the actual open.
+                # Let archive.write() perform the authoritative read and wrap
+                # failures from it below with the transfer-safe error message.
                 total += info.st_size
                 count += 1
                 if total > MAX_ARCHIVE_BYTES or count > MAX_FILES:
                     raise MigrationTransferError("server data exceeds migration limits")
-                archive.write(path, path.relative_to(root).as_posix())
+                try:
+                    archive.write(path, path.relative_to(root).as_posix())
+                except OSError as exc:
+                    raise MigrationTransferError("runtime agent cannot read a server data file") from exc
     archive_bytes = destination.stat().st_size
     if not 0 < archive_bytes <= MAX_ARCHIVE_BYTES:
         raise MigrationTransferError("migration archive exceeds its size limit")
