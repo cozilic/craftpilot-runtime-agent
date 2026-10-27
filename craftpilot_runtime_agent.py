@@ -1149,7 +1149,8 @@ class RuntimeNodeAgent:
             self.store.save(self.state)
             for server_id in cleared_server_ids:
                 LOGGER.info("server_report_resumed server_id=%s reason=assignment_removed", server_id)
-        server_ids = sorted(set(server_ids) & assigned_server_set)
+        staged_server_ids = self._staged_server_ids()
+        server_ids = sorted((set(server_ids) | set(staged_server_ids)) & assigned_server_set)
         for server_id in server_ids:
             if server_id in unassigned_servers:
                 continue
@@ -1190,6 +1191,18 @@ class RuntimeNodeAgent:
             raise AgentError("saved unassigned server state is invalid")
         return server_ids
 
+    def _staged_server_ids(self) -> list[str]:
+        try:
+            root = self.config.data_root.resolve(strict=True)
+            if not root.is_dir():
+                return []
+            return sorted(
+                entry.name.lower() for entry in root.iterdir()
+                if UUID_RE.fullmatch(entry.name) and not entry.is_symlink() and entry.is_dir()
+            )
+        except OSError:
+            return []
+
     def _clear_unassigned_server(self, server_id: str) -> None:
         unassigned_servers = self._unassigned_server_ids()
         if server_id in unassigned_servers:
@@ -1224,7 +1237,16 @@ class RuntimeNodeAgent:
             return None
         running = self.runtime._inspect(name, "{{.State.Running}}")
         if running is None:
-            return None
+            try:
+                self.runtime._server_data_path(server_id)
+            except (AgentError, OSError):
+                return None
+            return {
+                "sequence": sequence, "server_id": server_id, "status": "OFFLINE",
+                "cpu_percent": None, "memory_used_mb": None, "memory_limit_mb": None,
+                "uptime_seconds": None, "players_online": None, "players_max": None,
+                "disk_used_mb": self.runtime._server_disk_used_mb(server_id), "logs": [],
+            }
         self.runtime._verify_managed(server_id, name)
         state = self.runtime._inspect(name, "{{.State.Status}}")
         intentional_stops = self.state.get("intentional_stops", {}) if self.state is not None else {}

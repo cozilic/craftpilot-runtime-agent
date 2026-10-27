@@ -630,6 +630,42 @@ class DockerRuntimeTests(unittest.TestCase):
         self.assertEqual(1, RuntimeNodeAgent._parse_size_mb("1 MB"))
         self.assertIsNone(RuntimeNodeAgent._parse_size_mb("unknown"))
 
+    def test_staged_server_data_without_container_reports_offline(self):
+        runtime = DockerRuntime(self.config, FakeDocker(["__missing__"]))
+        agent = RuntimeNodeAgent(self.config, runtime=runtime)
+
+        report = agent._server_report(SERVER_ID, 7)
+
+        self.assertEqual("OFFLINE", report["status"])
+        self.assertIsNone(report["cpu_percent"])
+        self.assertIsNone(report["uptime_seconds"])
+        self.assertEqual([], report["logs"])
+
+    def test_runtime_agent_reports_assigned_staged_server_without_container(self):
+        state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 1}
+        runtime = DockerRuntime(self.config, FakeDocker(["__missing__"]))
+        store = SimpleNamespace(save=lambda _current: None)
+        agent = RuntimeNodeAgent(self.config, runtime=runtime, store=store)
+        agent.state = state
+        agent._assigned_server_ids = lambda: []
+        reports = []
+
+        def request(method, path, body, credential=False):
+            self.assertTrue(credential)
+            if method == "GET" and path.endswith("/servers"):
+                return {"servers": [SERVER_ID]}
+            if method == "POST" and path.endswith("/servers/report"):
+                reports.append(body)
+                return {"ok": True}
+            raise AssertionError(f"Unexpected telemetry request: {method} {path}")
+
+        agent._request = request
+        agent._report_servers(2)
+
+        self.assertEqual(1, len(reports))
+        self.assertEqual(SERVER_ID, reports[0]["server_id"])
+        self.assertEqual("OFFLINE", reports[0]["status"])
+
     def test_server_report_returns_status_metrics_logs_and_data_disk_usage(self):
         (self.config.data_root / SERVER_ID / "existing.txt").write_text("x" * 100)
         labels = json.dumps({"craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID})
