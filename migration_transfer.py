@@ -111,6 +111,8 @@ def _build_archive(server_root: Path, destination: Path) -> tuple[int, int, str]
                     raise MigrationTransferError("server data changed while being archived") from exc
                 if not stat.S_ISREG(info.st_mode):
                     raise MigrationTransferError("server data contains a symlink or special entry")
+                if not os.access(path, os.R_OK):
+                    raise MigrationTransferError("runtime agent cannot read a server data file")
                 total += info.st_size
                 count += 1
                 if total > MAX_ARCHIVE_BYTES or count > MAX_FILES:
@@ -173,8 +175,20 @@ def export_encrypted(server_root: Path, state_dir: Path, migration_id: str,
         return metadata
 
 
-def _safe_extract(archive_path: Path, payload_root: Path) -> int:
-    payload_root.mkdir(mode=0o700, parents=True, exist_ok=False)
+def _prepare_shared_path(path: Path, group_id: int, *, directory: bool) -> None:
+    """Make migrated files traversable/readable by the configured Minecraft group."""
+    if os.name == "nt":
+        return
+    try:
+        os.chown(path, -1, group_id)
+        os.chmod(path, 0o2770 if directory else 0o660)
+    except OSError as exc:
+        raise MigrationTransferError("runtime agent cannot prepare destination data permissions") from exc
+
+
+def _safe_extract(archive_path: Path, payload_root: Path, group_id: int = 33) -> int:
+    payload_root.mkdir(mode=0o2770, parents=True, exist_ok=False)
+    _prepare_shared_path(payload_root, group_id, directory=True)
     expanded = 0
     files = 0
     root = payload_root.resolve(strict=True)
@@ -198,12 +212,14 @@ def _safe_extract(archive_path: Path, payload_root: Path) -> int:
                 if expanded > MAX_EXPANDED_BYTES:
                     raise MigrationTransferError("migration archive exceeds extraction limits")
                 if item.is_dir():
-                    target.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    target.mkdir(mode=0o2770, parents=True, exist_ok=True)
+                    _prepare_shared_path(target, group_id, directory=True)
                     continue
                 files += 1
                 if files > MAX_FILES:
                     raise MigrationTransferError("migration archive contains too many files")
-                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                target.parent.mkdir(mode=0o2770, parents=True, exist_ok=True)
+                _prepare_shared_path(target.parent, group_id, directory=True)
                 if target.exists() or target.is_symlink():
                     raise MigrationTransferError("migration archive contains duplicate paths")
                 with archive.open(item, "r") as source, target.open("xb") as output:
@@ -215,6 +231,7 @@ def _safe_extract(archive_path: Path, payload_root: Path) -> int:
                         output.write(chunk)
                     if copied != item.file_size:
                         raise MigrationTransferError("migration archive entry was truncated")
+                _prepare_shared_path(target, group_id, directory=False)
         return files
     except (zipfile.BadZipFile, OSError, RuntimeError) as exc:
         shutil.rmtree(payload_root, ignore_errors=True)
@@ -229,7 +246,7 @@ def _safe_extract(archive_path: Path, payload_root: Path) -> int:
 def import_encrypted(data_root: Path, state_dir: Path, migration_id: str,
                      server_id: str, source_node_id: str, destination_node_id: str,
                      receiver_private_key: str, metadata: dict[str, object],
-                     get_chunk: Callable[[int], bytes]) -> dict[str, object]:
+                     get_chunk: Callable[[int], bytes], data_gid: int = 33) -> dict[str, object]:
     """Authenticate/decrypt every ordered chunk, verify ZIP, then leave in staging."""
     expected = metadata
     if (not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", migration_id)
@@ -310,7 +327,7 @@ def import_encrypted(data_root: Path, state_dir: Path, migration_id: str,
             os.fsync(archive.fileno())
         if received != archive_bytes or digest.hexdigest() != expected["archive_sha256"]:
             raise MigrationTransferError("decrypted migration archive does not match its digest")
-        files = _safe_extract(archive_path, payload_root)
+        files = _safe_extract(archive_path, payload_root, data_gid)
         archive_path.unlink()
         marker = {"migration_id": migration_id, "server_id": server_id,
                   "sha256": expected["archive_sha256"], "archive_bytes": archive_bytes, "files": files}

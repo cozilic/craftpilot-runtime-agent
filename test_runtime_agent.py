@@ -818,6 +818,37 @@ class DockerRuntimeTests(unittest.TestCase):
                          if call[0] == "request" and call[1].endswith(f"/commands/{command_id}/ack"))
         self.assertLess(saved_index, ack_index)
 
+    def test_migration_stop_persists_intent_before_acknowledgment(self):
+        command_id = "05bb4925-1a55-49e0-a940-115f06572ee9"
+        migration_id = "a2716e76-3e0c-40eb-9337-8d77a7aa23c6"
+        calls = []
+        state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 1}
+        store = SimpleNamespace(save=lambda saved: calls.append(("save", json.loads(json.dumps(saved)))))
+        agent = RuntimeNodeAgent(self.config, runtime=SimpleNamespace(execute=lambda *_args, **_kwargs: {
+            "success": True, "result_code": "MIGRATION_STOPPED",
+        }), store=store)
+        agent.state = state
+
+        def request(_method, path, _body, credential=False):
+            calls.append(("request", path))
+            if path.endswith("/commands/claim"):
+                return {"command": {
+                    "id": command_id, "lease_token": "l" * 64, "type": "migration_stop",
+                    "payload": {"server_id": SERVER_ID, "migration_id": migration_id},
+                }}
+            return {"ok": True}
+
+        agent._request = request
+        agent._report_servers = lambda _sequence: None
+        agent.poll_once()
+
+        self.assertEqual({SERVER_ID: command_id}, state["intentional_stops"])
+        saved_index = next(index for index, call in enumerate(calls)
+                           if call[0] == "save" and call[1].get("intentional_stops") == {SERVER_ID: command_id})
+        ack_index = next(index for index, call in enumerate(calls)
+                         if call[0] == "request" and call[1].endswith(f"/commands/{command_id}/ack"))
+        self.assertLess(saved_index, ack_index)
+
     def test_running_report_clears_old_intentional_stop(self):
         labels = json.dumps({"craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID})
         runner = FakeDocker(["true", labels, "running", "2026-10-26T10:00:00Z|0|123"])
@@ -895,6 +926,60 @@ class DockerRuntimeTests(unittest.TestCase):
         self.assertEqual(1, sleep.call_count)
         self.assertFalse(any(call[:2] == ["docker", "stop"] for call in runner.calls))
         self.assertFalse(any(call[:2] == ["docker", "kill"] for call in runner.calls))
+
+    def test_migration_stop_uses_docker_graceful_signal_when_rcon_state_is_missing(self):
+        labels = json.dumps({"craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID})
+        runner = FakeDocker(["true", labels, "running", "exited"])
+        runtime = DockerRuntime(self.config, runner)
+        runtime.state = {"node_id": self.config.node_id, "credential": "c" * 64}
+        runtime.state_store = MemoryStateStore()
+        command_id = "05bb4925-1a55-49e0-a940-115f06572ee9"
+        migration_id = "a2716e76-3e0c-40eb-9337-8d77a7aa23c6"
+        source_id = self.config.node_id
+        destination_id = "fc94aeda-4379-477a-8bb8-47ad51c0ea76"
+        payload = {
+            "server_id": SERVER_ID,
+            "migration_id": migration_id,
+            "source_node_id": source_id,
+            "destination_node_id": destination_id,
+            "_migration_command_id": command_id,
+            "_migration_lease_token": "l" * 64,
+        }
+
+        result = runtime.execute("migration_stop", payload)
+
+        self.assertEqual({"success": True, "result_code": "MIGRATION_STOPPED"}, result)
+        self.assertTrue(any(call[:2] == ["docker", "kill"] and "--signal=TERM" in call for call in runner.calls))
+        self.assertFalse(any(call[:2] == ["docker", "kill"] and "--signal=KILL" in call for call in runner.calls))
+        self.assertFalse(any(call[:2] == ["docker", "stop"] for call in runner.calls))
+        self.assertFalse(any(call[:2] == ["docker", "exec"] for call in runner.calls))
+
+    def test_migration_graceful_sigterm_waits_past_old_docker_stop_timeout(self):
+        labels = json.dumps({"craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID})
+        runner = FakeDocker(["true", labels, "running", "running", "exited"])
+        runtime = DockerRuntime(self.config, runner)
+        runtime.state = {"node_id": self.config.node_id, "credential": "c" * 64}
+        runtime.state_store = MemoryStateStore()
+        command_id = "05bb4925-1a55-49e0-a940-115f06572ee9"
+        migration_id = "a2716e76-3e0c-40eb-9337-8d77a7aa23c6"
+        payload = {
+            "server_id": SERVER_ID,
+            "migration_id": migration_id,
+            "source_node_id": self.config.node_id,
+            "destination_node_id": "fc94aeda-4379-477a-8bb8-47ad51c0ea76",
+            "_migration_command_id": command_id,
+            "_migration_lease_token": "l" * 64,
+        }
+
+        with patch.object(agent_module.time, "monotonic", side_effect=[0.0, 6000.0]):
+            with patch.object(agent_module.time, "sleep", return_value=None) as sleep:
+                result = runtime.execute("migration_stop", payload)
+
+        self.assertEqual("MIGRATION_STOPPED", result["result_code"])
+        self.assertEqual(2, sleep.call_count)
+        self.assertTrue(any(call[:3] == ["docker", "kill", "--signal=TERM"] for call in runner.calls))
+        self.assertFalse(any(call[:3] == ["docker", "kill", "--signal=KILL"] for call in runner.calls))
+        self.assertFalse(any(call[:2] == ["docker", "stop"] for call in runner.calls))
 
     def test_command_cannot_choose_a_container_name(self):
         payload = {"server_id": SERVER_ID, "container": make_spec(self.config)}

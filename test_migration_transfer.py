@@ -6,6 +6,7 @@ import hashlib
 import tempfile
 import unittest
 import zipfile
+from unittest.mock import patch
 from pathlib import Path
 
 import migration_transfer as transfer
@@ -65,6 +66,11 @@ class MigrationTransferTests(unittest.TestCase):
         self.assertFalse((self.destination_root / ".craftpilot-migrations" / MIGRATION_ID).exists())
         transfer.commit_staged(self.destination_root, self.destination_state, MIGRATION_ID, SERVER_ID,
                                str(self.metadata["archive_sha256"]))
+
+    def test_archive_refuses_files_the_runtime_agent_cannot_read(self) -> None:
+        with patch.object(transfer.os, "access", return_value=False):
+            with self.assertRaisesRegex(transfer.MigrationTransferError, "cannot read"):
+                transfer._build_archive(self.source_root, self.root / "unreadable.zip")
 
     def test_tampered_or_reordered_ciphertext_is_rejected_and_staging_removed(self) -> None:
         tampered = list(self.chunks)

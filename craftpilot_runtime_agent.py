@@ -335,7 +335,13 @@ class DockerRuntime:
         if command_type == "migration_stop":
             if self.config.node_id != source_node_id:
                 raise AgentError("migration stop is not addressed to this source node")
-            result = self._stop(server_id, container_name, False)
+            # The CraftPilot manager issues this fixed lifecycle operation after
+            # authorizing the migration. It must work for older server data that
+            # predates the agent's optional RCON credential state.
+            force = payload.get("force", False)
+            if not isinstance(force, bool):
+                raise AgentError("migration stop force flag is invalid")
+            result = self._stop(server_id, container_name, force, allow_docker_graceful=True)
             if result["result_code"] not in ("STOPPED", "ALREADY_STOPPED"):
                 raise AgentError("source server did not stop before migration")
             return {"success": True, "result_code": "MIGRATION_STOPPED"}
@@ -389,7 +395,7 @@ class DockerRuntime:
             result = migration_transfer.import_encrypted(
                 self.config.data_root, self.config.state_dir, migration_id, server_id,
                 source_node_id, destination_node_id, key_entry["private_key"],
-                manifest, get_chunk,
+                manifest, get_chunk, data_gid=self.config.data_gid,
             )
             return {"success": True, "result_code": "MIGRATION_STAGED",
                     "message": str(result["archive_sha256"]), "container_id": str(result["archive_bytes"])}
@@ -582,7 +588,7 @@ class DockerRuntime:
         except (OSError, TimeoutError) as exc:
             raise DockerError("could not reach the Minecraft RCON endpoint") from exc
 
-    def _stop(self, server_id: str, name: str, force: bool) -> dict[str, Any]:
+    def _stop(self, server_id: str, name: str, force: bool, allow_docker_graceful: bool = False) -> dict[str, Any]:
         running = self._inspect(name, "{{.State.Running}}")
         if running is None:
             LOGGER.info("server_stop_noop server_id=%s reason=container_missing", server_id)
@@ -598,9 +604,19 @@ class DockerRuntime:
             self._run(["docker", "kill", "--signal=KILL", name], timeout=15)
         else:
             LOGGER.info("server_graceful_stop_requested server_id=%s", server_id)
-            self._send_rcon(server_id, name, "stop")
-            deadline = time.monotonic() + self.config.stop_grace_seconds + 15
-            while time.monotonic() < deadline:
+            if allow_docker_graceful:
+                # Send SIGTERM directly rather than using `docker stop`, which
+                # escalates to SIGKILL automatically when its timeout expires.
+                # This supports old servers without RCON while never force-killing.
+                self._run(["docker", "kill", "--signal=TERM", name], timeout=15)
+            else:
+                self._send_rcon(server_id, name, "stop")
+            # Docker was configured with a one-second implicit stop timeout
+            # when the legacy server container was created. For this authorized
+            # migration path, wait without that deadline and do not ever follow
+            # SIGTERM with SIGKILL.
+            deadline = None if allow_docker_graceful else time.monotonic() + self.config.stop_grace_seconds + 15
+            while deadline is None or time.monotonic() < deadline:
                 state = self._inspect(name, "{{.State.Status}}")
                 if state == "exited":
                     LOGGER.info("server_stopped server_id=%s method=graceful", server_id)
@@ -1037,7 +1053,7 @@ class RuntimeNodeAgent:
             LOGGER.error("command_execution_failed command_id=%s type=%s server_id=%s error=%s",
                          command_id, command_type, command_server_id, str(exc)[:300])
             result = {"success": False, "result_code": "RUNTIME_ERROR", "message": str(exc)[:300]}
-        if command_type in ("start", "stop") and result.get("success"):
+        if command_type in ("start", "stop", "migration_stop") and result.get("success"):
             server_id = payload.get("server_id")
             if isinstance(server_id, str) and UUID_RE.fullmatch(server_id):
                 stopped_servers = self.state.setdefault("intentional_stops", {})
@@ -1047,7 +1063,7 @@ class RuntimeNodeAgent:
                     for key, value in stopped_servers.items()
                 ):
                     raise AgentError("saved intentional stop state is invalid")
-                if command_type == "stop":
+                if command_type in ("stop", "migration_stop"):
                     stopped_servers[server_id] = command_id
                     self.store.save(self.state)
         self._request("POST", f"/api/runtime/nodes/{self.config.node_id}/commands/{command_id}/ack",
