@@ -6,10 +6,15 @@ services:
       dockerfile: Dockerfile
     container_name: craftpilot-runtime-agent
     restart: unless-stopped
-    # Docker socket is privileged. DAC_OVERRIDE lets the UUID-confined cleanup
-    # remove Minecraft-owned files despite owner-only modes on the shared bind.
+    # Compose drops capabilities for a non-root process. Run as root with only
+    # the file-operation capabilities migration needs on the data bind.
+    user: "0:0"
+    cap_drop:
+      - ALL
     cap_add:
+      - CHOWN
       - DAC_OVERRIDE
+      - FOWNER
     group_add:
       - "${DOCKER_GID:?Set DOCKER_GID to the numeric group ID of /var/run/docker.sock}"
       - "33"
