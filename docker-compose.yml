@@ -6,8 +6,10 @@ services:
       dockerfile: Dockerfile
     container_name: craftpilot-runtime-agent
     restart: unless-stopped
-    # Docker socket is privileged. Supplemental groups permit socket access
-    # and shared writes; the agent keeps staged data writable to Minecraft.
+    # Docker socket is privileged. DAC_OVERRIDE lets the UUID-confined cleanup
+    # remove Minecraft-owned files despite owner-only modes on the shared bind.
+    cap_add:
+      - DAC_OVERRIDE
     group_add:
       - "${DOCKER_GID:?Set DOCKER_GID to the numeric group ID of /var/run/docker.sock}"
       - "33"
