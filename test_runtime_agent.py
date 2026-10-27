@@ -26,6 +26,7 @@ Config = agent_module.Config
 AgentError = agent_module.AgentError
 DockerRuntime = agent_module.DockerRuntime
 RuntimeNodeAgent = agent_module.RuntimeNodeAgent
+FileTreeIndex = agent_module.file_tree_index.FileTreeIndex
 
 SERVER_ID = "e7b4b542-70b0-4cf7-a2ac-2a6597de165d"
 CONTAINER_NAME = "craftpilot-e7b4b542"
@@ -521,7 +522,6 @@ class DockerRuntimeTests(unittest.TestCase):
         def request(method, path, body, credential=False):
             if path.endswith("/commands/claim"):
                 return {"command": command}
-                return {"command": command}
             requests.append((path.rsplit("/", 1)[-1], body))
             return {"ok": True}
 
@@ -537,6 +537,86 @@ class DockerRuntimeTests(unittest.TestCase):
                          result_request[1])
         self.assertEqual("ack", ack_request[0])
         self.assertTrue(ack_request[1]["success"])
+
+    def test_file_tree_index_serves_repeated_listing_without_rescanning(self):
+        index = FileTreeIndex(self.config.data_root, self.config.state_dir)
+        index._ready = True
+        scan = patch.object(FileTreeIndex, "scan_path", wraps=FileTreeIndex.scan_path)
+        with scan as scan_directory:
+            self.runtime.file_tree_index = index
+            first = self.runtime._list_server_files(SERVER_ID, "")
+            second = self.runtime._list_server_files(SERVER_ID, "")
+
+        self.assertEqual(first, second)
+        self.assertEqual(1, scan_directory.call_count)
+        self.assertTrue(index.index_path.is_file())
+        if os.name != "nt":
+            self.assertEqual(0o600, index.index_path.stat().st_mode & 0o777)
+
+    def test_file_tree_index_invalidates_on_directory_mtime_change(self):
+        index = FileTreeIndex(self.config.data_root, self.config.state_dir)
+        index._ready = True
+        self.runtime.file_tree_index = index
+        first = self.runtime._list_server_files(SERVER_ID, "")
+        (self.config.data_root / SERVER_ID / "new.txt").write_text("new")
+        second = self.runtime._list_server_files(SERVER_ID, "")
+
+        self.assertNotEqual([entry["name"] for entry in first["entries"]],
+                            [entry["name"] for entry in second["entries"]])
+        self.assertIn("new.txt", [entry["name"] for entry in second["entries"]])
+
+    def test_file_tree_index_persists_and_rejects_corrupt_json(self):
+        index = FileTreeIndex(self.config.data_root, self.config.state_dir)
+        index._ready = True
+        self.runtime.file_tree_index = index
+        expected = self.runtime._list_server_files(SERVER_ID, "")
+
+        self.config.state_dir.mkdir(parents=True, exist_ok=True)
+        index._persist_locked()
+        restored = FileTreeIndex(self.config.data_root, self.config.state_dir)
+        self.assertIn(SERVER_ID, restored._directories)
+        self.assertEqual(expected["entries"], restored._directories[SERVER_ID]["entries"])
+        self.config.state_dir.mkdir(parents=True, exist_ok=True)
+        restored.index_path.write_text("not json", encoding="utf-8")
+        corrupt = FileTreeIndex(self.config.data_root, self.config.state_dir)
+        self.assertEqual({}, corrupt._directories)
+        corrupt._ready = True
+        self.runtime.file_tree_index = corrupt
+        rebuilt = self.runtime._list_server_files(SERVER_ID, "")
+        self.assertEqual(expected, rebuilt)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "inotify is available only on Linux")
+    def test_file_tree_index_inotify_refreshes_external_directory_changes(self):
+        import time
+
+        index = FileTreeIndex(self.config.data_root, self.config.state_dir)
+        index.start()
+        self.addCleanup(index.close)
+        self.assertTrue(index.wait_until_ready())
+        key = FileTreeIndex.directory_key(SERVER_ID, "")
+        self.assertIn(key, index._directories)
+
+        (self.config.data_root / SERVER_ID / "external.txt").write_text("external")
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            record = index._directories.get(key, {})
+            if "external.txt" in {entry["name"] for entry in record.get("entries", [])}:
+                break
+            time.sleep(0.01)
+
+        self.assertIn("external.txt", {entry["name"] for entry in index._directories[key]["entries"]})
+
+    def test_file_tree_index_invalidate_forces_rescan(self):
+        index = FileTreeIndex(self.config.data_root, self.config.state_dir)
+        index._ready = True
+        self.runtime.file_tree_index = index
+        first = self.runtime._list_server_files(SERVER_ID, "")
+        index.invalidate(SERVER_ID, "")
+        (self.config.data_root / SERVER_ID / "new.txt").write_text("new")
+        second = self.runtime._list_server_files(SERVER_ID, "")
+
+        self.assertNotEqual(first, second)
+        self.assertIn("new.txt", [entry["name"] for entry in second["entries"]])
 
     def test_remote_file_list_and_read_use_fd_relative_paths_and_reject_symlink_escape(self):
         (self.config.data_root / SERVER_ID / "docs").mkdir()

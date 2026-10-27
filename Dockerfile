@@ -16,7 +16,7 @@ RUN python -m pip install --no-cache-dir --upgrade pip \
     && python -c "import cryptography; assert cryptography.__version__ == '46.0.5'"
 
 WORKDIR /opt/craftpilot-runtime-agent
-COPY craftpilot_runtime_agent.py migration_transfer.py ./
+COPY craftpilot_runtime_agent.py migration_transfer.py file_tree_index.py ./
 COPY test_migration_transfer.py ./
 RUN python -m unittest -q test_migration_transfer
 

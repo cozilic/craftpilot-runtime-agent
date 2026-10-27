@@ -25,6 +25,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 
+import file_tree_index
 import migration_transfer
 from pathlib import Path
 from typing import Any
@@ -146,6 +147,7 @@ class DockerRuntime:
         if not NAME_RE.fullmatch(self.agent_container_name):
             raise AgentError("CRAFTPILOT_AGENT_CONTAINER_NAME is invalid")
         self._opener = urllib.request.build_opener(_NoRedirectHandler())
+        self.file_tree_index: file_tree_index.FileTreeIndex | None = None
 
     def execute(self, command_type: str, payload: dict[str, Any], credential: str | None = None,
                 command_id: str | None = None) -> dict[str, Any]:
@@ -908,30 +910,18 @@ class DockerRuntime:
     def _list_server_files(self, server_id: str, relative: Any) -> dict[str, Any]:
         directory_fd, normalized = self._open_server_file(server_id, relative, allow_directory=True)
         try:
-            entries = []
-            iterator = os.scandir(directory_fd)
-            with iterator:
-                for item in iterator:
-                    if len(entries) >= 1000:
-                        raise AgentError("directory contains too many entries to display")
-                    info = item.stat(follow_symlinks=False)
-                    name = item.name
-                    if (not name or name in (".", "..") or len(name.encode("utf-8")) > 255
-                            or re.search(r"[\x00-\x1f\x7f/\\]", name)):
-                        continue
-                    if stat.S_ISLNK(info.st_mode):
-                        kind, size = "link", info.st_size
-                    elif stat.S_ISDIR(info.st_mode):
-                        kind, size = "dir", None
-                    elif stat.S_ISREG(info.st_mode):
-                        kind, size = "file", info.st_size
-                    else:
-                        kind, size = "link", None
-                    from datetime import datetime, timezone
-                    modified = datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat().replace("+00:00", "Z")
-                    entries.append({"name": name, "type": kind, "size": size, "modified_at": modified})
-            rank = {"dir": 0, "link": 1, "file": 2}
-            entries.sort(key=lambda item: (rank[item["type"]], item["name"]))
+            info = os.fstat(directory_fd) if not isinstance(directory_fd, Path) else directory_fd.stat()
+
+            def scan() -> list[dict[str, Any]]:
+                if isinstance(directory_fd, Path):
+                    return file_tree_index.FileTreeIndex.scan_path(directory_fd)
+                return file_tree_index.FileTreeIndex.scan_directory(directory_fd)
+
+            index = self.file_tree_index
+            entries = (index.list_entries(server_id, normalized, info.st_mtime_ns, scan)
+                       if index is not None else scan())
+            if len(entries) > 1000:
+                raise AgentError("directory contains too many entries to display")
             parent = normalized.rpartition("/")[0] if "/" in normalized else ("" if normalized else None)
             return {"path": normalized, "parent": parent, "entries": entries}
         finally:
@@ -1370,6 +1360,9 @@ class RuntimeNodeAgent:
     def __init__(self, config: Config, runtime: DockerRuntime | None = None, store: StateStore | None = None):
         self.config, self.runtime = config, runtime or DockerRuntime(config)
         self.store = store or StateStore(config.state_dir)
+        self.file_tree_index = file_tree_index.FileTreeIndex(config.data_root, config.state_dir)
+        if isinstance(self.runtime, DockerRuntime):
+            self.runtime.file_tree_index = self.file_tree_index
         self.state: dict[str, Any] | None = None
         self._opener = urllib.request.build_opener(_NoRedirectHandler())
         self._last_reported_states: dict[str, str] = {}
@@ -1602,6 +1595,13 @@ class RuntimeNodeAgent:
                 payload["_migration_command_id" if command_type.startswith("migration_") else "_file_command_id"] = command_id
                 payload["_migration_lease_token" if command_type.startswith("migration_") else "_file_lease_token"] = lease_token
             result = self.runtime.execute(command_type, payload, credential=self.state["credential"], command_id=command_id)
+            if command_type == "file_mutate" and result.get("success"):
+                operation = payload.get("operation")
+                path = payload.get("path")
+                if operation in ("write", "delete", "zip", "unzip", "rename") and isinstance(path, str):
+                    self.file_tree_index.invalidate(payload["server_id"], path.rpartition("/")[0])
+                elif operation in ("mkdir", "touch", "upload") and isinstance(path, str):
+                    self.file_tree_index.invalidate(payload["server_id"], path)
             if command_type in ("file_list", "file_read", "file_mutate") and result.get("success"):
                 file_result = result.pop("result", None)
                 if not isinstance(file_result, dict):
@@ -1886,6 +1886,7 @@ class RuntimeNodeAgent:
         return [entry[2] for entry in entries[-100:]]
 
     def run_forever(self) -> None:
+        self.file_tree_index.start()
         if self.ensure_registered():
             LOGGER.info("runtime_agent_online node_id=%s", self.config.node_id)
         while True:
@@ -1970,12 +1971,16 @@ def main() -> int:
                 raise AgentError("another agent process already holds the state lock") from exc
             signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
             LOGGER.info("runtime_agent_started node_id=%s", config.node_id or "pending_enrollment")
-            RuntimeNodeAgent(config).run_forever()
+            agent = RuntimeNodeAgent(config)
+            agent.run_forever()
     except AgentError as exc:
         LOGGER.error("runtime_agent_fatal error=%s", exc)
         return 1
     except KeyboardInterrupt:
         return 0
+    finally:
+        if "agent" in locals():
+            agent.file_tree_index.close()
     return 0
 
 
