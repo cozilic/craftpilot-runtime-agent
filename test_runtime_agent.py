@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -11,7 +12,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -85,6 +86,8 @@ class FakeDocker:
             return SimpleNamespace(returncode=0, stdout=CONTAINER_NAME, stderr="")
         if args[:2] == ["docker", "stop"] or args[:2] == ["docker", "kill"]:
             return SimpleNamespace(returncode=0, stdout=CONTAINER_NAME, stderr="")
+        if args[:2] == ["docker", "cp"] and args[-1] == "-":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
         raise AssertionError(f"Unexpected Docker call: {args}")
 
 
@@ -926,6 +929,70 @@ class DockerRuntimeTests(unittest.TestCase):
         self.assertEqual(1, sleep.call_count)
         self.assertFalse(any(call[:2] == ["docker", "stop"] for call in runner.calls))
         self.assertFalse(any(call[:2] == ["docker", "kill"] for call in runner.calls))
+
+    def test_migration_export_copies_stopped_container_data_instead_of_reading_host_mount(self):
+        labels = json.dumps({"craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID})
+        runner = FakeDocker(["false", labels])
+        runtime = DockerRuntime(self.config, runner)
+        runtime.state = {"node_id": self.config.node_id, "credential": "c" * 64}
+        command_id = "05bb4925-1a55-49e0-a940-115f06572ee9"
+        migration_id = "a2716e76-3e0c-40eb-9337-8d77a7aa23c6"
+        destination_id = "fc94aeda-4379-477a-8bb8-47ad51c0ea76"
+        payload = {
+            "server_id": SERVER_ID,
+            "migration_id": migration_id,
+            "source_node_id": self.config.node_id,
+            "destination_node_id": destination_id,
+            "destination_public_key": "bm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5u",
+            "_migration_command_id": command_id,
+            "_migration_lease_token": "l" * 64,
+        }
+        runtime._migration_request = lambda *_args, **_kwargs: {"ok": True}
+        def export(_server_root, _state_dir, _migration_id, _source, _destination, _public_key,
+                   _manifest, _chunk, *, archive_stream=None):
+            self.assertEqual(b"archive from container", archive_stream.read())
+            return {"archive_sha256": "a" * 64, "archive_bytes": 23}
+
+        with patch.object(agent_module.migration_transfer, "export_encrypted", side_effect=export):
+            with patch.object(agent_module.subprocess, "Popen", return_value=SimpleNamespace(
+                stdout=io.BytesIO(b"archive from container"),
+                wait=lambda: 0,
+                poll=lambda: 0,
+            )) as popen:
+                result = runtime.execute("migration_export", payload)
+
+        self.assertEqual("MIGRATION_EXPORTED", result["result_code"])
+        popen.assert_called_once_with(
+            ["docker", "cp", f"{CONTAINER_NAME}:/data/.", "-"],
+            stdout=agent_module.subprocess.PIPE,
+            stderr=ANY,
+        )
+        self.assertTrue(any(call[:3] == ["docker", "inspect", "--format"] for call in runner.calls))
+
+    def test_migration_export_refuses_running_or_foreign_container(self):
+        command_id = "05bb4925-1a55-49e0-a940-115f06572ee9"
+        migration_id = "a2716e76-3e0c-40eb-9337-8d77a7aa23c6"
+        destination_id = "fc94aeda-4379-477a-8bb8-47ad51c0ea76"
+        payload = {
+            "server_id": SERVER_ID,
+            "migration_id": migration_id,
+            "source_node_id": self.config.node_id,
+            "destination_node_id": destination_id,
+            "destination_public_key": "bm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5u",
+            "_migration_command_id": command_id,
+            "_migration_lease_token": "l" * 64,
+        }
+        running = DockerRuntime(self.config, FakeDocker(["true", json.dumps({
+            "craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID,
+        })]))
+        with self.assertRaisesRegex(AgentError, "while the server container is running"):
+            running.execute("migration_export", payload)
+
+        foreign = DockerRuntime(self.config, FakeDocker(["false", json.dumps({
+            "craftpilot.managed": "1", "craftpilot.server_id": "00000000-0000-0000-0000-000000000000",
+        })]))
+        with self.assertRaisesRegex(AgentError, "not owned"):
+            foreign.execute("migration_export", payload)
 
     def test_migration_stop_uses_docker_graceful_signal_when_rcon_state_is_missing(self):
         labels = json.dumps({"craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID})

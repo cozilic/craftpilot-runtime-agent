@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import tarfile
 import tempfile
 import unittest
 import zipfile
@@ -73,6 +75,43 @@ class MigrationTransferTests(unittest.TestCase):
 
         self.assertGreater(archive_bytes, 0)
         self.assertEqual(2, files)
+
+    def test_archive_can_be_built_from_a_validated_docker_tar_stream(self) -> None:
+        tar_stream = io.BytesIO()
+        with tarfile.open(fileobj=tar_stream, mode="w") as source:
+            directory = tarfile.TarInfo("./world/")
+            directory.type = tarfile.DIRTYPE
+            source.addfile(directory)
+            file_info = tarfile.TarInfo("./world/level.dat")
+            file_info.size = 10
+            source.addfile(file_info, io.BytesIO(b"world-data"))
+        tar_stream.seek(0)
+
+        _archive_bytes, files, _digest = transfer._build_archive(
+            self.source_root, self.root / "docker-copy.zip", tar_stream,
+        )
+
+        self.assertEqual(1, files)
+        with zipfile.ZipFile(self.root / "docker-copy.zip") as archive:
+            self.assertEqual(b"world-data", archive.read("world/level.dat"))
+
+    def test_archive_rejects_unsafe_paths_and_links_in_docker_tar_stream(self) -> None:
+        for name, entry_type in (("../escape.txt", tarfile.REGTYPE), ("world/link", tarfile.SYMTYPE)):
+            with self.subTest(name=name):
+                tar_stream = io.BytesIO()
+                with tarfile.open(fileobj=tar_stream, mode="w") as source:
+                    file_info = tarfile.TarInfo(name)
+                    file_info.type = entry_type
+                    if entry_type == tarfile.REGTYPE:
+                        file_info.size = 4
+                        source.addfile(file_info, io.BytesIO(b"nope"))
+                    else:
+                        file_info.linkname = "../../outside"
+                        source.addfile(file_info)
+                tar_stream.seek(0)
+
+                with self.assertRaisesRegex(transfer.MigrationTransferError, "unsafe path or file type"):
+                    transfer._build_archive(self.source_root, self.root / "unsafe-docker-copy.zip", tar_stream)
 
     def test_archive_refuses_files_the_runtime_agent_cannot_read(self) -> None:
         original_write = zipfile.ZipFile.write

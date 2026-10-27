@@ -13,10 +13,11 @@ import os
 import re
 import shutil
 import stat
+import tarfile
 import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import Callable
+from typing import BinaryIO, Callable
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes, serialization
@@ -83,46 +84,18 @@ def _nonce(prefix: bytes, index: int) -> bytes:
     return prefix + index.to_bytes(8, "big")
 
 
-def _build_archive(server_root: Path, destination: Path) -> tuple[int, int, str]:
+def _build_archive(server_root: Path, destination: Path,
+                   source_stream: BinaryIO | None = None) -> tuple[int, int, str]:
     root = server_root.resolve(strict=True)
     if (not root.is_dir() or server_root.is_symlink()
             or not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", root.name)):
         raise MigrationTransferError("server data root is not a safe UUID directory")
-    total = 0
-    count = 0
     with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=3,
                          allowZip64=True) as archive:
-        for current, directories, filenames in os.walk(root, topdown=True, followlinks=False):
-            current_path = Path(current)
-            safe_directories: list[str] = []
-            for name in sorted(directories):
-                path = current_path / name
-                if path.is_symlink() or not path.is_dir():
-                    raise MigrationTransferError("server data contains a symlink or special entry")
-                safe_directories.append(name)
-                relative = path.relative_to(root).as_posix().rstrip("/") + "/"
-                archive.writestr(relative, b"")
-            directories[:] = safe_directories
-            for name in sorted(filenames):
-                path = current_path / name
-                try:
-                    info = path.lstat()
-                except OSError as exc:
-                    raise MigrationTransferError("server data changed while being archived") from exc
-                if not stat.S_ISREG(info.st_mode):
-                    raise MigrationTransferError("server data contains a symlink or special entry")
-                # os.access() is affected by ACLs and platform-specific mount
-                # semantics; its advisory result can contradict the actual open.
-                # Let archive.write() perform the authoritative read and wrap
-                # failures from it below with the transfer-safe error message.
-                total += info.st_size
-                count += 1
-                if total > MAX_ARCHIVE_BYTES or count > MAX_FILES:
-                    raise MigrationTransferError("server data exceeds migration limits")
-                try:
-                    archive.write(path, path.relative_to(root).as_posix())
-                except OSError as exc:
-                    raise MigrationTransferError("runtime agent cannot read a server data file") from exc
+        if source_stream is not None:
+            count = _add_tar_stream_to_archive(source_stream, archive)
+        else:
+            count = _add_directory_to_archive(root, archive)
     archive_bytes = destination.stat().st_size
     if not 0 < archive_bytes <= MAX_ARCHIVE_BYTES:
         raise MigrationTransferError("migration archive exceeds its size limit")
@@ -133,17 +106,120 @@ def _build_archive(server_root: Path, destination: Path) -> tuple[int, int, str]
     return archive_bytes, count, digest.hexdigest()
 
 
+def _add_directory_to_archive(root: Path, archive: zipfile.ZipFile) -> int:
+    total = 0
+    count = 0
+    for current, directories, filenames in os.walk(root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        safe_directories: list[str] = []
+        for name in sorted(directories):
+            path = current_path / name
+            if path.is_symlink() or not path.is_dir():
+                raise MigrationTransferError("server data contains a symlink or special entry")
+            safe_directories.append(name)
+            relative = path.relative_to(root).as_posix().rstrip("/") + "/"
+            archive.writestr(relative, b"")
+        directories[:] = safe_directories
+        for name in sorted(filenames):
+            path = current_path / name
+            try:
+                info = path.lstat()
+            except OSError as exc:
+                raise MigrationTransferError("server data changed while being archived") from exc
+            if not stat.S_ISREG(info.st_mode):
+                raise MigrationTransferError("server data contains a symlink or special entry")
+            total += info.st_size
+            count += 1
+            if total > MAX_ARCHIVE_BYTES or count > MAX_FILES:
+                raise MigrationTransferError("server data exceeds migration limits")
+            try:
+                archive.write(path, path.relative_to(root).as_posix())
+            except OSError as exc:
+                raise MigrationTransferError("runtime agent cannot read a server data file") from exc
+    return count
+
+
+def _add_tar_stream_to_archive(source_stream: BinaryIO, archive: zipfile.ZipFile) -> int:
+    total = 0
+    count = 0
+    entries = 0
+    seen: set[str] = set()
+    files: set[str] = set()
+    directories: set[str] = set()
+    try:
+        with tarfile.open(fileobj=source_stream, mode="r|") as source:
+            for item in source:
+                name = item.name
+                while name.startswith("./"):
+                    name = name[2:]
+                if name in ("", ".") and item.isdir():
+                    continue
+                if item.isdir() and name.endswith("/"):
+                    name = name[:-1]
+                member = PurePosixPath(name)
+                if (not name or "\\" in name or member.is_absolute()
+                        or any(part in ("", ".", "..") for part in name.split("/"))
+                        or not (item.isfile() or item.isdir())):
+                    raise MigrationTransferError("server data archive contains an unsafe path or file type")
+                path = member.as_posix()
+                if path in seen or (item.isfile() and path in directories) or (item.isdir() and path in files):
+                    raise MigrationTransferError("server data archive contains duplicate or conflicting paths")
+                parent = PurePosixPath(path).parent
+                while parent != PurePosixPath("."):
+                    if parent.as_posix() in files:
+                        raise MigrationTransferError("server data archive contains conflicting paths")
+                    directories.add(parent.as_posix())
+                    parent = parent.parent
+                if item.isfile():
+                    files.add(path)
+                else:
+                    directories.add(path)
+                seen.add(path)
+                entries += 1
+                if entries > MAX_FILES * 2:
+                    raise MigrationTransferError("server data archive contains too many entries")
+                archive_name = path + ("/" if item.isdir() else "")
+                if item.isdir():
+                    archive.writestr(archive_name, b"")
+                    continue
+                total += item.size
+                count += 1
+                if total > MAX_ARCHIVE_BYTES or count > MAX_FILES:
+                    raise MigrationTransferError("server data exceeds migration limits")
+                source = source.extractfile(item)
+                if source is None:
+                    raise MigrationTransferError("server data archive entry is unreadable")
+                info = zipfile.ZipInfo(member.as_posix())
+                info.compress_type = zipfile.ZIP_DEFLATED
+                remaining = item.size
+                with source, archive.open(info, "w") as output:
+                    while remaining:
+                        chunk = source.read(min(CHUNK_BYTES, remaining))
+                        if not chunk:
+                            raise MigrationTransferError("server data archive entry was truncated")
+                        output.write(chunk)
+                        remaining -= len(chunk)
+                    if source.read(1):
+                        raise MigrationTransferError("server data archive entry exceeded its declared size")
+        while source_stream.read(CHUNK_BYTES):
+            pass
+    except (tarfile.TarError, OSError, EOFError) as exc:
+        raise MigrationTransferError("server data archive from Docker is invalid") from exc
+    return count
+
+
 def export_encrypted(server_root: Path, state_dir: Path, migration_id: str,
                      source_node_id: str, destination_node_id: str, destination_public_key: str,
                      send_manifest: Callable[[dict[str, object]], None],
-                     send_chunk: Callable[[int, bytes], None]) -> dict[str, object]:
+                     send_chunk: Callable[[int, bytes], None],
+                     archive_stream: BinaryIO | None = None) -> dict[str, object]:
     """Build and relay an encrypted archive without exposing plaintext to master."""
     receiver_public = _unb64(destination_public_key, 32, "destination public key")
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(state_dir, 0o700)
     with tempfile.TemporaryDirectory(prefix="migration-export-", dir=state_dir) as work:
         archive_path = Path(work) / "server.zip"
-        archive_bytes, files, digest = _build_archive(server_root, archive_path)
+        archive_bytes, files, digest = _build_archive(server_root, archive_path, archive_stream)
         count = (archive_bytes + CHUNK_BYTES - 1) // CHUNK_BYTES
         ephemeral = X25519PrivateKey.generate()
         ephemeral_public = ephemeral.public_key().public_bytes(serialization.Encoding.Raw,
