@@ -1005,6 +1005,47 @@ class DockerRuntimeTests(unittest.TestCase):
         )
         self.assertTrue(any(call[:3] == ["docker", "inspect", "--format"] for call in runner.calls))
 
+    def test_migration_transfer_error_is_acknowledged_and_does_not_stop_the_poll_loop(self):
+        command_id = "05bb4925-1a55-49e0-a940-115f06572ee9"
+        commands = iter([{
+            "id": command_id,
+            "lease_token": "l" * 64,
+            "type": "migration_export",
+            "payload": {"server_id": SERVER_ID},
+        }, None])
+        acknowledgements = []
+        runtime = DockerRuntime(self.config, FakeDocker([]))
+        store = MemoryStateStore()
+        agent = RuntimeNodeAgent(self.config, runtime=runtime, store=store)
+        agent.state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 0}
+        runtime.state = agent.state
+
+        def request(method, path, body, credential=False):
+            self.assertTrue(credential)
+            if path.endswith("/commands/claim"):
+                return {"command": next(commands)}
+            if path.endswith(f"/commands/{command_id}/ack"):
+                acknowledgements.append(body)
+                return {"ok": True}
+            raise AssertionError(f"Unexpected request: {method} {path}")
+
+        agent._request = request
+        agent._report_servers = lambda _sequence: None
+        transfer_error = agent_module.migration_transfer.MigrationTransferError(
+            "server data archive from Docker is invalid",
+        )
+        with patch.object(runtime, "_migration", side_effect=transfer_error):
+            with self.assertLogs("craftpilot.runtime_agent", level="ERROR") as captured:
+                agent.poll_once()
+                agent.poll_once()
+
+        self.assertEqual(1, len(acknowledgements))
+        self.assertFalse(acknowledgements[0]["success"])
+        self.assertEqual("RUNTIME_ERROR", acknowledgements[0]["result_code"])
+        self.assertIn("server data archive from Docker is invalid", acknowledgements[0]["message"])
+        self.assertTrue(any("command_execution_failed" in message for message in captured.output))
+        self.assertEqual(2, agent.state["sequence"])
+
     def test_migration_export_refuses_running_or_foreign_container(self):
         command_id = "05bb4925-1a55-49e0-a940-115f06572ee9"
         migration_id = "a2716e76-3e0c-40eb-9337-8d77a7aa23c6"

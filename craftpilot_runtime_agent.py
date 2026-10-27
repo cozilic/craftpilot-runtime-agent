@@ -169,7 +169,10 @@ class DockerRuntime:
         if command_type == "console":
             return self._console(server_id, expected_name, payload.get("command"))
         if command_type in ("migration_prepare", "migration_stop", "migration_export", "migration_import", "migration_commit", "migration_delete_source"):
-            return self._migration(command_type, server_id, expected_name, payload, credential)
+            try:
+                return self._migration(command_type, server_id, expected_name, payload, credential)
+            except migration_transfer.MigrationTransferError as exc:
+                raise AgentError(str(exc)) from exc
         raise AgentError("unsupported command type")
 
     def _stage_snapshot(self, server_id: str, payload: dict[str, Any], credential: str | None,
