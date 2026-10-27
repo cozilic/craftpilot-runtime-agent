@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
-import io
 import json
 import os
 import shutil
@@ -12,7 +11,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
-from unittest.mock import ANY, patch
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -966,7 +965,7 @@ class DockerRuntimeTests(unittest.TestCase):
         self.assertFalse(any(call[:2] == ["docker", "stop"] for call in runner.calls))
         self.assertFalse(any(call[:2] == ["docker", "kill"] for call in runner.calls))
 
-    def test_migration_export_copies_stopped_container_data_instead_of_reading_host_mount(self):
+    def test_migration_export_uses_shared_data_mount_for_stopped_container(self):
         labels = json.dumps({"craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID})
         runner = FakeDocker(["false", labels])
         runtime = DockerRuntime(self.config, runner)
@@ -984,25 +983,16 @@ class DockerRuntimeTests(unittest.TestCase):
             "_migration_lease_token": "l" * 64,
         }
         runtime._migration_request = lambda *_args, **_kwargs: {"ok": True}
-        def export(_server_root, _state_dir, _migration_id, _source, _destination, _public_key,
-                   _manifest, _chunk, *, archive_stream=None):
-            self.assertEqual(b"archive from container", archive_stream.read())
-            return {"archive_sha256": "a" * 64, "archive_bytes": 23}
-
-        with patch.object(agent_module.migration_transfer, "export_encrypted", side_effect=export):
-            with patch.object(agent_module.subprocess, "Popen", return_value=SimpleNamespace(
-                stdout=io.BytesIO(b"archive from container"),
-                wait=lambda: 0,
-                poll=lambda: 0,
-            )) as popen:
+        expected_result = {"archive_sha256": "a" * 64, "archive_bytes": 23}
+        with patch.object(agent_module.migration_transfer, "export_encrypted", return_value=expected_result) as export:
+            with patch.object(agent_module.subprocess, "Popen") as popen:
                 result = runtime.execute("migration_export", payload)
 
         self.assertEqual("MIGRATION_EXPORTED", result["result_code"])
-        popen.assert_called_once_with(
-            ["docker", "cp", f"{CONTAINER_NAME}:/data/.", "-"],
-            stdout=agent_module.subprocess.PIPE,
-            stderr=ANY,
-        )
+        export.assert_called_once()
+        self.assertEqual((self.config.data_root / SERVER_ID).resolve(), export.call_args.args[0])
+        self.assertNotIn("archive_stream", export.call_args.kwargs)
+        popen.assert_not_called()
         self.assertTrue(any(call[:3] == ["docker", "inspect", "--format"] for call in runner.calls))
 
     def test_migration_transfer_error_is_acknowledged_and_does_not_stop_the_poll_loop(self):

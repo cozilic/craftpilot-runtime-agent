@@ -21,12 +21,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from contextlib import contextmanager
 from dataclasses import dataclass
 
 import migration_transfer
 from pathlib import Path
-from typing import Any, BinaryIO, Iterator
+from typing import Any
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 CONTAINER_RE = re.compile(r"^craftpilot-[0-9a-f]{8}$")
@@ -372,18 +371,10 @@ class DockerRuntime:
                     raise AgentError("refusing to export migration data while the server container is running")
                 if running != "false":
                     raise AgentError("source server container state is invalid for migration export")
-            if running is None:
-                result = migration_transfer.export_encrypted(
-                    server_root, self.config.state_dir, migration_id,
-                    source_node_id, destination_node_id, payload["destination_public_key"], send_manifest, send_chunk,
-                )
-            else:
-                with self._copy_stopped_container_data(container_name) as archive_stream:
-                    result = migration_transfer.export_encrypted(
-                        server_root, self.config.state_dir, migration_id,
-                        source_node_id, destination_node_id, payload["destination_public_key"], send_manifest, send_chunk,
-                        archive_stream=archive_stream,
-                    )
+            result = migration_transfer.export_encrypted(
+                server_root, self.config.state_dir, migration_id,
+                source_node_id, destination_node_id, payload["destination_public_key"], send_manifest, send_chunk,
+            )
             return {"success": True, "result_code": "MIGRATION_EXPORTED",
                     "message": str(result["archive_sha256"]), "container_id": str(result["archive_bytes"])}
         if command_type == "migration_import":
@@ -440,32 +431,6 @@ class DockerRuntime:
             migration_transfer.delete_source(self.config.data_root, server_id)
             return {"success": True, "result_code": "MIGRATION_SOURCE_DELETED"}
         raise AgentError("unsupported migration operation")
-
-    @contextmanager
-    def _copy_stopped_container_data(self, container_name: str) -> Iterator[BinaryIO]:
-        """Stream /data from a verified stopped container without host read access."""
-        try:
-            process = subprocess.Popen(
-                ["docker", "cp", f"{container_name}:/data/.", "-"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
-        except OSError as exc:
-            raise DockerError("could not start the controlled Docker data copy") from exc
-        assert process.stdout is not None
-        try:
-            yield process.stdout
-            process.stdout.close()
-            if process.wait() != 0:
-                raise DockerError("Docker could not read the stopped server container data")
-        except BaseException:
-            if process.poll() is None:
-                process.kill()
-            process.wait()
-            raise
-        finally:
-            if not process.stdout.closed:
-                process.stdout.close()
 
     def _start(self, server_id: str, name: str, spec: dict[str, Any]) -> dict[str, Any]:
         existing = self._inspect(name, "{{.State.Running}}")
