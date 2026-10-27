@@ -484,6 +484,36 @@ class DockerRuntimeTests(unittest.TestCase):
             self.runtime.execute("snapshot", payload, credential="c" * 64, command_id=command_id)
         self.assertEqual(["existing.txt"], [path.name for path in (self.config.data_root / SERVER_ID).iterdir()])
 
+    def test_remote_file_list_and_read_use_fd_relative_paths_and_reject_symlink_escape(self):
+        (self.config.data_root / SERVER_ID / "docs").mkdir()
+        (self.config.data_root / SERVER_ID / "docs" / "notes.txt").write_text("hello remote")
+        listed = self.runtime._list_server_files(SERVER_ID, "docs")
+        self.assertEqual("docs", listed["path"])
+        self.assertEqual("notes.txt", listed["entries"][0]["name"])
+        read = self.runtime._read_server_file(SERVER_ID, "docs/notes.txt")
+        self.assertEqual("hello remote", read["content"])
+
+        outside = self.root / "outside.txt"
+        outside.write_text("secret")
+        try:
+            (self.config.data_root / SERVER_ID / "escape.txt").symlink_to(outside)
+        except (OSError, NotImplementedError):
+            self.skipTest("Creating a symlink requires Windows developer mode or elevated privileges")
+        with self.assertRaises(AgentError):
+            self.runtime._read_server_file(SERVER_ID, "escape.txt")
+        with self.assertRaises(AgentError):
+            self.runtime._read_server_file(SERVER_ID, "../outside.txt")
+
+    def test_remote_file_listing_rejects_a_symlink_server_root(self):
+        server_root = self.config.data_root / SERVER_ID
+        server_root.rename(self.root / "actual-server-data")
+        try:
+            server_root.symlink_to(self.root / "actual-server-data", target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("Creating a symlink requires Windows developer mode or elevated privileges")
+        with self.assertRaises(AgentError):
+            self.runtime._list_server_files(SERVER_ID, "")
+
     def test_start_creates_only_expected_container_with_limits_and_labels(self):
         (self.config.data_root / SERVER_ID / "existing.txt").unlink()
         (self.config.data_root / SERVER_ID / "server.properties").write_text("motd=Test\nenable-rcon=false\n")

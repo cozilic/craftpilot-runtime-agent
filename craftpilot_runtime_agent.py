@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import logging
 import math
@@ -12,6 +13,7 @@ import re
 import shutil
 import signal
 import socket
+import ssl
 import stat
 import subprocess
 import sys
@@ -167,6 +169,17 @@ class DockerRuntime:
             return self._stop(server_id, expected_name, force)
         if command_type == "console":
             return self._console(server_id, expected_name, payload.get("command"))
+        if command_type == "file_list":
+            return {"success": True, "result_code": "FILE_LISTED",
+                    "result": self._list_server_files(server_id, payload.get("path"))}
+        if command_type == "file_read":
+            return {"success": True, "result_code": "FILE_READ",
+                    "result": self._read_server_file(server_id, payload.get("path"))}
+        if command_type == "file_download":
+            return self._download_server_file(
+                server_id, payload.get("path"), payload.get("_file_command_id"),
+                payload.get("_file_lease_token"), credential,
+            )
         if command_type in ("migration_prepare", "migration_stop", "migration_export", "migration_import", "migration_commit", "migration_delete_source"):
             try:
                 return self._migration(command_type, server_id, expected_name, payload, credential)
@@ -490,6 +503,203 @@ class DockerRuntime:
         LOGGER.info("server_console_command_sent server_id=%s", server_id)
         return {"success": True, "result_code": "CONSOLE_EXECUTED",
                 "message": hashlib.sha256(command.encode("utf-8")).hexdigest()}
+
+    def _open_server_file(self, server_id: str, relative: Any, allow_directory: bool = False) -> tuple[Any, str]:
+        if not isinstance(relative, str) or len(relative.encode("utf-8")) > 4096 or "\x00" in relative:
+            raise AgentError("remote file path is invalid")
+        if relative.startswith("/") or re.match(r"^[A-Za-z]:", relative):
+            raise AgentError("remote file paths must be relative")
+        segments = []
+        for segment in relative.replace("\\", "/").split("/"):
+            if segment in ("", "."):
+                continue
+            if segment == ".." or len(segment.encode("utf-8")) > 255 or re.search(r"[\x00-\x1f\x7f]", segment):
+                raise AgentError("remote file path contains an unsafe segment")
+            segments.append(segment)
+        if len(segments) > 32 or (not allow_directory and not segments):
+            raise AgentError("remote file path depth or target is invalid")
+
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        if os.name == "nt" or not hasattr(os, "supports_dir_fd") or os.open not in os.supports_dir_fd:
+            root = self.config.data_root.resolve(strict=True)
+            server_root = root / server_id
+            current = server_root
+            try:
+                if server_root.is_symlink() or not server_root.is_dir():
+                    raise AgentError("server data is not a safe directory")
+                for segment in segments:
+                    current = current / segment
+                    if current.is_symlink():
+                        raise AgentError("remote file path crosses a symbolic link")
+                resolved = current.resolve(strict=True)
+                if resolved != server_root.resolve(strict=True) and server_root.resolve(strict=True) not in resolved.parents:
+                    raise AgentError("remote file path escapes the server directory")
+                if resolved.is_dir():
+                    if not allow_directory:
+                        raise AgentError("remote file path is a directory")
+                    return resolved, "/".join(segments)
+                if not resolved.is_file():
+                    raise AgentError("remote file is not a regular file")
+                return os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)), "/".join(segments)
+            except (OSError, ValueError) as exc:
+                raise AgentError("remote file path does not exist or crosses a symbolic link") from exc
+
+        open_descriptors: list[int] = []
+        try:
+            root_fd = os.open(self.config.data_root, directory_flags)
+            open_descriptors.append(root_fd)
+            current_fd = os.open(server_id, directory_flags, dir_fd=root_fd)
+            open_descriptors.append(current_fd)
+            for segment in segments[:-1]:
+                current_fd = os.open(segment, directory_flags, dir_fd=current_fd)
+                open_descriptors.append(current_fd)
+            if segments:
+                target_fd = os.open(
+                    segments[-1], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=current_fd,
+                )
+                info = os.fstat(target_fd)
+                if stat.S_ISDIR(info.st_mode) and not allow_directory:
+                    os.close(target_fd)
+                    raise AgentError("remote file path is a directory")
+                if not stat.S_ISDIR(info.st_mode) and not stat.S_ISREG(info.st_mode):
+                    os.close(target_fd)
+                    raise AgentError("remote file is not a regular file")
+            else:
+                target_fd = os.dup(current_fd)
+            return target_fd, "/".join(segments)
+        except (OSError, ValueError) as exc:
+            raise AgentError("remote file path does not exist or crosses a symbolic link") from exc
+        finally:
+            for descriptor in reversed(open_descriptors):
+                os.close(descriptor)
+
+    def _list_server_files(self, server_id: str, relative: Any) -> dict[str, Any]:
+        directory_fd, normalized = self._open_server_file(server_id, relative, allow_directory=True)
+        try:
+            entries = []
+            iterator = os.scandir(directory_fd)
+            with iterator:
+                for item in iterator:
+                    if len(entries) >= 1000:
+                        raise AgentError("directory contains too many entries to display")
+                    info = item.stat(follow_symlinks=False)
+                    name = item.name
+                    if (not name or name in (".", "..") or len(name.encode("utf-8")) > 255
+                            or re.search(r"[\x00-\x1f\x7f/\\]", name)):
+                        continue
+                    if stat.S_ISLNK(info.st_mode):
+                        kind, size = "link", info.st_size
+                    elif stat.S_ISDIR(info.st_mode):
+                        kind, size = "dir", None
+                    elif stat.S_ISREG(info.st_mode):
+                        kind, size = "file", info.st_size
+                    else:
+                        kind, size = "link", None
+                    from datetime import datetime, timezone
+                    modified = datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat().replace("+00:00", "Z")
+                    entries.append({"name": name, "type": kind, "size": size, "modified_at": modified})
+            rank = {"dir": 0, "link": 1, "file": 2}
+            entries.sort(key=lambda item: (rank[item["type"]], item["name"]))
+            parent = normalized.rpartition("/")[0] if "/" in normalized else ("" if normalized else None)
+            return {"path": normalized, "parent": parent, "entries": entries}
+        finally:
+            if not isinstance(directory_fd, Path):
+                os.close(directory_fd)
+
+    def _read_server_file(self, server_id: str, relative: Any) -> dict[str, Any]:
+        descriptor, normalized = self._open_server_file(server_id, relative)
+        close_descriptor = False
+        try:
+            if isinstance(descriptor, Path):
+                descriptor = os.open(descriptor, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            close_descriptor = True
+            info = os.fstat(descriptor)
+            max_bytes = 4 * 1024 * 1024
+            if info.st_size > max_bytes:
+                raise AgentError("remote text file is too large to edit")
+            chunks, total = [], 0
+            while True:
+                chunk = os.read(descriptor, min(65536, max_bytes + 1 - total))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise AgentError("remote text file is too large to edit")
+                chunks.append(chunk)
+            content_bytes = b"".join(chunks)
+            if b"\0" in content_bytes[:8192]:
+                raise AgentError("remote file is binary and cannot be read as text")
+            try:
+                content = content_bytes.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise AgentError("remote file is not valid UTF-8 text") from exc
+            return {"path": normalized, "name": normalized.rsplit("/", 1)[-1],
+                    "content": content, "bytes": len(content_bytes)}
+        finally:
+            if close_descriptor:
+                os.close(descriptor)
+
+    def _download_server_file(self, server_id: str, relative: Any, command_id: Any,
+                              lease_token: Any, credential: str | None) -> dict[str, Any]:
+        if (not isinstance(command_id, str) or not UUID_RE.fullmatch(command_id)
+                or not isinstance(lease_token, str) or not re.fullmatch(r"[A-Za-z0-9]{64}", lease_token)
+                or not isinstance(credential, str) or not re.fullmatch(r"[A-Za-z0-9]{64}", credential)):
+            raise AgentError("remote file download lease is invalid")
+        descriptor, normalized = self._open_server_file(server_id, relative)
+        close_descriptor = False
+        try:
+            if isinstance(descriptor, Path):
+                descriptor = os.open(descriptor, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            close_descriptor = True
+            size = os.fstat(descriptor).st_size
+            if size > 2 * 1024 * 1024 * 1024:
+                raise AgentError("remote file exceeds the download size limit")
+            parsed = urllib.parse.urlsplit(self.config.master_url)
+            if (parsed.scheme != "https" or not parsed.hostname or not parsed.netloc
+                    or parsed.username is not None or parsed.password is not None
+                    or parsed.query or parsed.fragment):
+                raise AgentError("remote file result origin is invalid")
+            path = f"{parsed.path.rstrip('/')}/api/runtime/nodes/{self.config.node_id}/commands/{command_id}/result"
+            connection = http.client.HTTPSConnection(
+                parsed.hostname, parsed.port or 443, timeout=60, context=ssl.create_default_context(),
+            )
+            digest, sent = hashlib.sha256(), 0
+            try:
+                connection.putrequest("PUT", path)
+                connection.putheader("Authorization", f"Bearer {credential}")
+                connection.putheader("X-Result-Lease", lease_token)
+                connection.putheader("Content-Type", "application/octet-stream")
+                connection.putheader("Content-Length", str(size))
+                connection.endheaders()
+                while True:
+                    chunk = os.read(descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    connection.send(chunk)
+                    sent += len(chunk)
+                    digest.update(chunk)
+                if sent != size:
+                    raise AgentError("remote file changed while it was being downloaded")
+                response = connection.getresponse()
+                raw = response.read(4097)
+                if response.status != 200 or len(raw) > 4096:
+                    raise HttpStatusError(response.status)
+                try:
+                    receipt = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise AgentError("master returned invalid remote file receipt") from exc
+                expected_sha = digest.hexdigest()
+                if receipt.get("bytes") != size or receipt.get("sha256") != expected_sha:
+                    raise AgentError("master did not verify the complete remote file")
+                return {"success": True, "result_code": "FILE_DOWNLOADED",
+                        "message": expected_sha, "container_id": str(size)}
+            except (OSError, TimeoutError, http.client.HTTPException) as exc:
+                raise AgentError("could not upload the remote file to the CraftPilot master") from exc
+            finally:
+                connection.close()
+        finally:
+            if close_descriptor:
+                os.close(descriptor)
 
     def _ensure_rcon(self, server_id: str) -> None:
         if self.state is None or self.state_store is None:
@@ -1034,7 +1244,7 @@ class RuntimeNodeAgent:
         command_id, lease_token = command.get("id"), command.get("lease_token")
         command_type, payload = command.get("type"), command.get("payload")
         if (not isinstance(command_id, str) or not UUID_RE.fullmatch(command_id) or not isinstance(lease_token, str)
-                or len(lease_token) != 64 or command_type not in ("start", "stop", "snapshot", "console", "migration_prepare", "migration_stop", "migration_export", "migration_import", "migration_commit", "migration_delete_source") or not isinstance(payload, dict)):
+                or len(lease_token) != 64 or command_type not in ("start", "stop", "snapshot", "console", "file_list", "file_read", "file_download", "migration_prepare", "migration_stop", "migration_export", "migration_import", "migration_commit", "migration_delete_source") or not isinstance(payload, dict)):
             raise AgentError("master returned an invalid leased command")
         command_server_id = payload.get("server_id")
         if not isinstance(command_server_id, str) or not UUID_RE.fullmatch(command_server_id):
@@ -1055,11 +1265,19 @@ class RuntimeNodeAgent:
                 if stopped_servers.pop(server_id, None) is not None:
                     self.store.save(self.state)
         try:
-            if command_type.startswith("migration_"):
+            if command_type.startswith("migration_") or command_type == "file_download":
                 payload = dict(payload)
-                payload["_migration_command_id"] = command_id
-                payload["_migration_lease_token"] = lease_token
+                payload["_migration_command_id" if command_type.startswith("migration_") else "_file_command_id"] = command_id
+                payload["_migration_lease_token" if command_type.startswith("migration_") else "_file_lease_token"] = lease_token
             result = self.runtime.execute(command_type, payload, credential=self.state["credential"], command_id=command_id)
+            if command_type in ("file_list", "file_read") and result.get("success"):
+                file_result = result.pop("result", None)
+                if not isinstance(file_result, dict):
+                    raise AgentError("runtime returned an invalid remote file result")
+                self._request(
+                    "POST", f"/api/runtime/nodes/{self.config.node_id}/commands/{command_id}/result",
+                    {"lease_token": lease_token, "result": file_result}, credential=True,
+                )
         except (AgentError, DockerError) as exc:
             LOGGER.error("command_execution_failed command_id=%s type=%s server_id=%s error=%s",
                          command_id, command_type, command_server_id, str(exc)[:300])
