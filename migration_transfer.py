@@ -147,8 +147,8 @@ def _add_tar_stream_to_archive(source_stream: BinaryIO, archive: zipfile.ZipFile
     files: set[str] = set()
     directories: set[str] = set()
     try:
-        with tarfile.open(fileobj=source_stream, mode="r|") as source:
-            for item in source:
+        with tarfile.open(fileobj=source_stream, mode="r|") as tar_archive:
+            for item in tar_archive:
                 name = item.name
                 while name.startswith("./"):
                     name = name[2:]
@@ -186,20 +186,20 @@ def _add_tar_stream_to_archive(source_stream: BinaryIO, archive: zipfile.ZipFile
                 count += 1
                 if total > MAX_ARCHIVE_BYTES or count > MAX_FILES:
                     raise MigrationTransferError("server data exceeds migration limits")
-                source = source.extractfile(item)
-                if source is None:
+                entry_stream = tar_archive.extractfile(item)
+                if entry_stream is None:
                     raise MigrationTransferError("server data archive entry is unreadable")
                 info = zipfile.ZipInfo(member.as_posix())
                 info.compress_type = zipfile.ZIP_DEFLATED
                 remaining = item.size
-                with source, archive.open(info, "w") as output:
+                with entry_stream, archive.open(info, "w") as output:
                     while remaining:
-                        chunk = source.read(min(CHUNK_BYTES, remaining))
+                        chunk = entry_stream.read(min(CHUNK_BYTES, remaining))
                         if not chunk:
                             raise MigrationTransferError("server data archive entry was truncated")
                         output.write(chunk)
                         remaining -= len(chunk)
-                    if source.read(1):
+                    if entry_stream.read(1):
                         raise MigrationTransferError("server data archive entry exceeded its declared size")
         while source_stream.read(CHUNK_BYTES):
             pass
