@@ -70,7 +70,7 @@ class Config:
     data_root: Path
     images: frozenset[str]
     network: str = "craftpilot-servers"
-    poll_seconds: int = 30
+    poll_seconds: int = 5
     stop_grace_seconds: int = 30
     docker_timeout_seconds: int = 45
     docker_data_root: str | None = None
@@ -93,7 +93,7 @@ class Config:
         configured_images = os.environ.get("CRAFTPILOT_ALLOWED_IMAGES", "")
         images = frozenset(item.strip() for item in configured_images.split(",") if item.strip()) or DEFAULT_IMAGES
         network = os.environ.get("CRAFTPILOT_DOCKER_NETWORK", "craftpilot-servers")
-        poll_seconds = _bounded_int("CRAFTPILOT_POLL_SECONDS", 30, 5, 120)
+        poll_seconds = _bounded_int("CRAFTPILOT_POLL_SECONDS", 5, 2, 120)
         stop_grace = _bounded_int("CRAFTPILOT_STOP_GRACE_SECONDS", 30, 0, 45)
         if node_id is not None and not UUID_RE.fullmatch(node_id):
             raise AgentError("CRAFTPILOT_NODE_ID must be a node UUID")
@@ -180,6 +180,8 @@ class DockerRuntime:
                 server_id, payload.get("path"), payload.get("_file_command_id"),
                 payload.get("_file_lease_token"), credential,
             )
+        if command_type == "file_mutate":
+            return self._mutate_server_file(server_id, payload, credential, command_id)
         if command_type in ("migration_prepare", "migration_stop", "migration_export", "migration_import", "migration_commit", "migration_delete_source"):
             try:
                 return self._migration(command_type, server_id, expected_name, payload, credential)
@@ -572,6 +574,336 @@ class DockerRuntime:
         finally:
             for descriptor in reversed(open_descriptors):
                 os.close(descriptor)
+
+    def _mutate_server_file(self, server_id: str, payload: dict[str, Any], credential: str | None,
+                            command_id: str | None) -> dict[str, Any]:
+        operation = payload.get("operation")
+        if operation not in ("write", "upload", "mkdir", "touch", "rename", "delete", "zip", "unzip"):
+            raise AgentError("remote file mutation is unsupported")
+        relative = payload.get("path")
+        if operation == "write":
+            content = payload.get("content")
+            if not isinstance(content, str) or len(content.encode("utf-8")) > 4 * 1024 * 1024:
+                raise AgentError("remote text content is invalid or too large")
+            descriptor, normalized = self._open_server_parent(server_id, relative, allow_root=False)
+            parent_fd, name = descriptor
+            try:
+                self._atomic_write_at(parent_fd, name, content.encode("utf-8"))
+            finally:
+                os.close(parent_fd)
+        elif operation in ("mkdir", "touch"):
+            name = self._safe_filename(payload.get("name"))
+            parent_fd, normalized_parent = self._open_server_directory(server_id, relative)
+            try:
+                if operation == "mkdir":
+                    os.mkdir(name, 0o755, dir_fd=parent_fd)
+                else:
+                    descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644, dir_fd=parent_fd)
+                    os.close(descriptor)
+                self._apply_shared_permissions(parent_fd, name, directory=(operation == "mkdir"))
+            finally:
+                os.close(parent_fd)
+        elif operation == "rename":
+            name = self._safe_filename(payload.get("name"))
+            source_parent, source_name = self._open_server_parent(server_id, relative)
+            try:
+                os.stat(source_name, dir_fd=source_parent, follow_symlinks=False)
+                try:
+                    os.stat(name, dir_fd=source_parent, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise AgentError("a file with that name already exists")
+                os.rename(source_name, name, src_dir_fd=source_parent, dst_dir_fd=source_parent)
+            finally:
+                os.close(source_parent)
+        elif operation == "delete":
+            parent_fd, name = self._open_server_parent(server_id, relative)
+            try:
+                info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode):
+                    self._remove_tree_at(parent_fd, name)
+                else:
+                    os.unlink(name, dir_fd=parent_fd)
+            finally:
+                os.close(parent_fd)
+        elif operation == "upload":
+            upload_result = self._upload_server_file(server_id, relative, payload, credential, command_id)
+        elif operation == "zip":
+            self._zip_server_path(server_id, relative)
+        elif operation == "unzip":
+            self._unzip_server_file(server_id, relative)
+
+        result = {"operation": operation, "ok": True}
+        if operation == "upload":
+            result.update(upload_result)
+        return {"success": True, "result_code": "FILE_MUTATED", "result": result}
+
+    @staticmethod
+    def _safe_filename(value: Any) -> str:
+        if (not isinstance(value, str) or not value or value in (".", "..")
+                or len(value.encode("utf-8")) > 255 or "/" in value or "\\" in value
+                or re.search(r"[\x00-\x1f\x7f]", value)):
+            raise AgentError("remote file name is invalid")
+        return value
+
+    def _server_directory_fd(self, server_id: str) -> int:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        root_fd = os.open(self.config.data_root, flags)
+        try:
+            result = os.open(server_id, flags, dir_fd=root_fd)
+        finally:
+            os.close(root_fd)
+        return result
+
+    def _open_server_directory(self, server_id: str, relative: Any) -> tuple[int, str]:
+        _descriptor, normalized = self._open_server_file(server_id, relative, allow_directory=True)
+        if isinstance(_descriptor, Path):
+            root = self._server_data_path(server_id)
+            directory = root.joinpath(*([segment for segment in normalized.split("/") if segment]))
+            return os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)), normalized
+        return _descriptor, normalized
+
+    def _open_server_parent(self, server_id: str, relative: Any, allow_root: bool = False) -> tuple[int, str]:
+        if not isinstance(relative, str) or len(relative.encode("utf-8")) > 4096:
+            raise AgentError("remote file path is invalid")
+        normalized = self._normalize_server_path(relative, allow_root=allow_root)
+        segments = normalized.split("/") if normalized else []
+        if not segments:
+            raise AgentError("server root is not a file target")
+        filename = segments.pop()
+        parent = "/".join(segments)
+        parent_fd, _ = self._open_server_directory(server_id, parent)
+        return parent_fd, filename
+
+    def _normalize_server_path(self, relative: Any, allow_root: bool = True) -> str:
+        if not isinstance(relative, str) or len(relative.encode("utf-8")) > 4096 or "\x00" in relative:
+            raise AgentError("remote file path is invalid")
+        if relative.startswith("/") or re.match(r"^[A-Za-z]:", relative):
+            raise AgentError("remote file paths must be relative")
+        segments = []
+        for segment in relative.replace("\\", "/").split("/"):
+            if segment in ("", "."):
+                continue
+            if segment == ".." or len(segment.encode("utf-8")) > 255 or re.search(r"[\x00-\x1f\x7f]", segment):
+                raise AgentError("remote file path contains an unsafe segment")
+            segments.append(segment)
+        if len(segments) > 32 or (not allow_root and not segments):
+            raise AgentError("remote file path depth or target is invalid")
+        return "/".join(segments)
+
+    def _apply_shared_permissions(self, parent_fd: int, name: str, directory: bool) -> None:
+        if os.name == "nt":
+            return
+        flags = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if stat.S_ISLNK(flags.st_mode):
+            raise AgentError("refusing to change permissions on a symbolic link")
+        path = f"/proc/self/fd/{parent_fd}/{name}"
+        try:
+            os.chown(path, -1, self.config.data_gid, follow_symlinks=False)
+            os.chmod(path, 0o2770 if directory else 0o660, follow_symlinks=False)
+        except OSError as exc:
+            raise AgentError("could not apply shared server file permissions") from exc
+
+    def _atomic_write_at(self, parent_fd: int, name: str, content: bytes) -> None:
+        try:
+            existing = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and not stat.S_ISREG(existing.st_mode):
+            raise AgentError("remote write target must be a regular file")
+        temporary = f".cp-write-{os.urandom(8).hex()}"
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o660, dir_fd=parent_fd)
+        try:
+            with os.fdopen(descriptor, "wb", closefd=False) as output:
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            self._apply_shared_permissions(parent_fd, temporary, directory=False)
+            os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        finally:
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            os.close(descriptor)
+
+    def _remove_tree_at(self, parent_fd: int, name: str) -> None:
+        directory_fd = os.open(name, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+        try:
+            for entry in os.scandir(directory_fd):
+                info = entry.stat(follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode):
+                    self._remove_tree_at(directory_fd, entry.name)
+                else:
+                    os.unlink(entry.name, dir_fd=directory_fd)
+        finally:
+            os.close(directory_fd)
+        os.rmdir(name, dir_fd=parent_fd)
+
+    def _upload_server_file(self, server_id: str, relative: Any, payload: dict[str, Any],
+                            credential: str | None, command_id: str | None) -> dict[str, Any]:
+        metadata = payload.get("upload")
+        if (not isinstance(metadata, dict) or not isinstance(metadata.get("filename"), str)
+                or not re.fullmatch(r"[a-f0-9]{48}\.bin", metadata["filename"])
+                or not isinstance(metadata.get("bytes"), int) or isinstance(metadata.get("bytes"), bool)
+                or not 0 <= metadata["bytes"] <= 2 * 1024 * 1024 * 1024
+                or not isinstance(metadata.get("sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", metadata["sha256"])
+                or not isinstance(command_id, str) or not UUID_RE.fullmatch(command_id)
+                or not isinstance(payload.get("_file_lease_token"), str)
+                or not re.fullmatch(r"[A-Za-z0-9]{64}", payload["_file_lease_token"])
+                or not isinstance(credential, str) or not re.fullmatch(r"[A-Za-z0-9]{64}", credential)):
+            raise AgentError("remote upload metadata or lease is invalid")
+        parsed = urllib.parse.urlsplit(self.config.master_url)
+        if (parsed.scheme != "https" or not parsed.hostname or not parsed.netloc
+                or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment):
+            raise AgentError("remote upload origin is invalid")
+        request_path = f"{parsed.path.rstrip('/')}/api/runtime/nodes/{self.config.node_id}/commands/{command_id}/upload"
+        connection = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=120,
+                                                  context=ssl.create_default_context())
+        try:
+            connection.request("GET", request_path, headers={
+                "Authorization": f"Bearer {credential}",
+                "X-Result-Lease": payload["_file_lease_token"],
+                "Accept": "application/octet-stream",
+            })
+            response = connection.getresponse()
+            if response.status != 200:
+                response.read(4096)
+                raise AgentError("master rejected the staged upload")
+            if response.getheader("Content-Length") != str(metadata["bytes"]):
+                raise AgentError("staged upload size did not match its metadata")
+
+            directory_fd, _normalized_dir = self._open_server_directory(server_id, relative)
+            name = self._safe_filename(payload.get("name"))
+            try:
+                try:
+                    existing = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    existing = None
+                if existing is not None and (not payload.get("overwrite") or stat.S_ISDIR(existing.st_mode)):
+                    raise AgentError("upload target already exists")
+                temporary = f".cp-upload-{os.urandom(8).hex()}"
+                fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o660, dir_fd=directory_fd)
+                digest = hashlib.sha256()
+                received = 0
+                try:
+                    with os.fdopen(fd, "wb", closefd=False) as output:
+                        while True:
+                            chunk = response.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            received += len(chunk)
+                            if received > metadata["bytes"]:
+                                raise AgentError("staged upload exceeds its declared size")
+                            output.write(chunk)
+                            digest.update(chunk)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    if received != metadata["bytes"] or digest.hexdigest() != metadata["sha256"]:
+                        raise AgentError("staged upload size or digest did not match")
+                    self._apply_shared_permissions(directory_fd, temporary, directory=False)
+                    os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                finally:
+                    try:
+                        os.unlink(temporary, dir_fd=directory_fd)
+                    except FileNotFoundError:
+                        pass
+                    os.close(fd)
+            finally:
+                os.close(directory_fd)
+            return {"bytes": received, "sha256": digest.hexdigest()}
+        except (OSError, TimeoutError, http.client.HTTPException) as exc:
+            raise AgentError("could not download staged upload from the CraftPilot master") from exc
+        finally:
+            connection.close()
+
+    def _zip_server_path(self, server_id: str, relative: Any) -> None:
+        source = self._server_data_path(server_id).joinpath(*self._normalize_server_path(relative, allow_root=False).split("/"))
+        if source.is_symlink() or not source.exists():
+            raise AgentError("zip source does not exist or is a symbolic link")
+        if source.is_dir():
+            iterator = os.walk(source, followlinks=False)
+            entries = []
+            total = 0
+            for current, dirs, files in iterator:
+                if any((Path(current) / child).is_symlink() for child in dirs + files):
+                    raise AgentError("zip source contains a symbolic link")
+                for filename in files:
+                    item = Path(current) / filename
+                    total += item.stat().st_size
+                    entries.append(item)
+                    if len(entries) > 20000 or total > 4 * 1024 * 1024 * 1024:
+                        raise AgentError("zip source exceeds archive limits")
+        else:
+            if not source.is_file():
+                raise AgentError("zip source must be a regular file or directory")
+            entries = [source]
+        target = source.with_name(source.name + ".zip")
+        if target.exists() or target.is_symlink():
+            raise AgentError("zip archive already exists")
+        temporary = target.with_name(f".cp-zip-{os.urandom(8).hex()}.tmp")
+        try:
+            with zipfile.ZipFile(temporary, "x", compression=zipfile.ZIP_DEFLATED) as archive:
+                if source.is_dir():
+                    if not entries:
+                        archive.writestr(source.name + "/", "")
+                    for item in entries:
+                        archive.write(item, (Path(source.name) / item.relative_to(source)).as_posix())
+                else:
+                    archive.write(source, source.name)
+            os.chmod(temporary, 0o660)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _unzip_server_file(self, server_id: str, relative: Any) -> None:
+        source = self._server_data_path(server_id).joinpath(*self._normalize_server_path(relative, allow_root=False).split("/"))
+        if source.is_symlink() or not source.is_file():
+            raise AgentError("unzip source must be a regular archive file")
+        temporary = source.parent / f".cp-unzip-{os.urandom(8).hex()}"
+        temporary.mkdir(mode=0o700)
+        try:
+            with zipfile.ZipFile(source) as archive:
+                members = archive.infolist()
+                if not members or len(members) > 20000:
+                    raise AgentError("zip archive is empty or has too many entries")
+                total_bytes = 0
+                for member in members:
+                    name = member.filename.replace("\\\\", "/")
+                    mode = member.external_attr >> 16
+                    file_type = stat.S_IFMT(mode)
+                    parts = name.rstrip("/").split("/")
+                    if (not name or name.startswith("/") or "\\\\" in member.filename
+                            or any(part in ("", ".", "..") for part in parts)
+                            or (len(parts) > 32) or file_type not in (0, stat.S_IFREG, stat.S_IFDIR)
+                            or member.flag_bits & 1):
+                        raise AgentError("zip archive contains an unsafe path, symlink, or special file")
+                    total_bytes += member.file_size
+                    if member.file_size > 2 * 1024 * 1024 * 1024 or total_bytes > 4 * 1024 * 1024 * 1024:
+                        raise AgentError("zip archive exceeds extraction size limits")
+                    if member.compress_size > 0 and member.file_size / member.compress_size > 200:
+                        raise AgentError("zip archive exceeds the decompression ratio limit")
+                for member in members:
+                    target = (temporary / member.filename.replace("\\\\", "/")).resolve()
+                    if temporary.resolve() not in target.parents and target != temporary.resolve():
+                        raise AgentError("zip entry escapes temporary extraction directory")
+                    if member.is_dir():
+                        target.mkdir(parents=True, exist_ok=True)
+                    else:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with archive.open(member) as src, target.open("xb") as dst:
+                            shutil.copyfileobj(src, dst, 1024 * 1024)
+            top = [child for child in temporary.iterdir()]
+            existing = {child.name for child in source.parent.iterdir()}
+            conflicts = existing.intersection(child.name for child in top)
+            conflicts.discard(temporary.name)
+            if conflicts:
+                raise AgentError("zip extraction conflicts with existing files")
+            for child in top:
+                os.replace(child, source.parent / child.name)
+        finally:
+            shutil.rmtree(temporary, ignore_errors=True)
 
     def _list_server_files(self, server_id: str, relative: Any) -> dict[str, Any]:
         directory_fd, normalized = self._open_server_file(server_id, relative, allow_directory=True)
@@ -1244,7 +1576,7 @@ class RuntimeNodeAgent:
         command_id, lease_token = command.get("id"), command.get("lease_token")
         command_type, payload = command.get("type"), command.get("payload")
         if (not isinstance(command_id, str) or not UUID_RE.fullmatch(command_id) or not isinstance(lease_token, str)
-                or len(lease_token) != 64 or command_type not in ("start", "stop", "snapshot", "console", "file_list", "file_read", "file_download", "migration_prepare", "migration_stop", "migration_export", "migration_import", "migration_commit", "migration_delete_source") or not isinstance(payload, dict)):
+                or len(lease_token) != 64 or command_type not in ("start", "stop", "snapshot", "console", "file_list", "file_read", "file_download", "file_mutate", "migration_prepare", "migration_stop", "migration_export", "migration_import", "migration_commit", "migration_delete_source") or not isinstance(payload, dict)):
             raise AgentError("master returned an invalid leased command")
         command_server_id = payload.get("server_id")
         if not isinstance(command_server_id, str) or not UUID_RE.fullmatch(command_server_id):
@@ -1265,12 +1597,12 @@ class RuntimeNodeAgent:
                 if stopped_servers.pop(server_id, None) is not None:
                     self.store.save(self.state)
         try:
-            if command_type.startswith("migration_") or command_type == "file_download":
+            if command_type.startswith("migration_") or command_type in ("file_download", "file_mutate"):
                 payload = dict(payload)
                 payload["_migration_command_id" if command_type.startswith("migration_") else "_file_command_id"] = command_id
                 payload["_migration_lease_token" if command_type.startswith("migration_") else "_file_lease_token"] = lease_token
             result = self.runtime.execute(command_type, payload, credential=self.state["credential"], command_id=command_id)
-            if command_type in ("file_list", "file_read") and result.get("success"):
+            if command_type in ("file_list", "file_read", "file_mutate") and result.get("success"):
                 file_result = result.pop("result", None)
                 if not isinstance(file_result, dict):
                     raise AgentError("runtime returned an invalid remote file result")

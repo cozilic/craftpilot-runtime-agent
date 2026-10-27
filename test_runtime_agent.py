@@ -484,6 +484,60 @@ class DockerRuntimeTests(unittest.TestCase):
             self.runtime.execute("snapshot", payload, credential="c" * 64, command_id=command_id)
         self.assertEqual(["existing.txt"], [path.name for path in (self.config.data_root / SERVER_ID).iterdir()])
 
+    def test_remote_file_upload_mutation_returns_verified_size_and_digest(self):
+        payload = {
+            "operation": "upload",
+            "path": "mods",
+            "upload": {"bytes": 12, "sha256": "a" * 64},
+        }
+        with patch.object(self.runtime, "_upload_server_file", return_value={"bytes": 12, "sha256": "a" * 64}) as upload:
+            result = self.runtime.execute("file_mutate", {"server_id": SERVER_ID, **payload},
+                                          credential="c" * 64, command_id="f1d64bb9-2585-4d7e-b0e2-463732a212ac")
+
+        self.assertEqual("FILE_MUTATED", result["result_code"])
+        self.assertEqual({"operation": "upload", "ok": True, "bytes": 12, "sha256": "a" * 64}, result["result"])
+        upload.assert_called_once()
+
+    def test_remote_file_upload_result_is_posted_before_command_acknowledgment(self):
+        command_id = "f1d64bb9-2585-4d7e-b0e2-463732a212ac"
+        command = {
+            "id": command_id,
+            "lease_token": "l" * 64,
+            "type": "file_mutate",
+            "payload": {"server_id": SERVER_ID, "operation": "upload"},
+        }
+        requests = []
+
+        class FakeRuntime:
+            def execute(self, command_type, payload, credential=None, command_id=None):
+                self_command = (command_type, payload, credential, command_id)
+                requests.append(("execute", self_command))
+                return {"success": True, "result_code": "FILE_MUTATED",
+                        "result": {"operation": "upload", "ok": True, "bytes": 12, "sha256": "a" * 64}}
+
+        agent = RuntimeNodeAgent(self.config, runtime=FakeRuntime(), store=MemoryStateStore())
+        agent.state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 0}
+
+        def request(method, path, body, credential=False):
+            if path.endswith("/commands/claim"):
+                return {"command": command}
+                return {"command": command}
+            requests.append((path.rsplit("/", 1)[-1], body))
+            return {"ok": True}
+
+        agent._request = request
+        agent._report_servers = lambda _sequence: None
+
+        agent.poll_once()
+
+        result_request, ack_request = requests[1:]
+        self.assertEqual("result", result_request[0])
+        self.assertEqual({"lease_token": "l" * 64,
+                          "result": {"operation": "upload", "ok": True, "bytes": 12, "sha256": "a" * 64}},
+                         result_request[1])
+        self.assertEqual("ack", ack_request[0])
+        self.assertTrue(ack_request[1]["success"])
+
     def test_remote_file_list_and_read_use_fd_relative_paths_and_reject_symlink_escape(self):
         (self.config.data_root / SERVER_ID / "docs").mkdir()
         (self.config.data_root / SERVER_ID / "docs" / "notes.txt").write_text("hello remote")
