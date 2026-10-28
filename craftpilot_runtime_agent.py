@@ -1563,6 +1563,7 @@ class RuntimeNodeAgent:
         command = claim.get("command")
         if command is None:
             self._report_servers(sequence)
+            self._sync_file_tree_cache()
             return
         if not isinstance(command, dict):
             raise AgentError("master returned an invalid command")
@@ -1635,6 +1636,35 @@ class RuntimeNodeAgent:
             LOGGER.info("command_completed command_id=%s type=%s server_id=%s result=%s",
                         command_id, command_type, command_server_id, result.get("result_code", "unknown"))
         self._report_servers(sequence)
+        self._sync_file_tree_cache()
+
+    def _sync_file_tree_cache(self) -> None:
+        if self.file_tree_index is None or self.state is None:
+            return
+        try:
+            assigned_response = self._request(
+                "GET", f"/api/runtime/nodes/{self.config.node_id}/servers", {}, credential=True,
+            )
+            assigned_ids = assigned_response.get("servers")
+            if (not isinstance(assigned_ids, list)
+                    or any(not isinstance(server_id, str) or not UUID_RE.fullmatch(server_id) for server_id in assigned_ids)):
+                raise AgentError("master returned an invalid server assignment list")
+            assigned = set(assigned_ids) - set(self._unassigned_server_ids())
+            pending = self.file_tree_index.pending_sync_updates(assigned)
+            if not pending:
+                return
+            updates = [(key, revision) for key, revision, _ in pending]
+            payload = {"directories": [update for _, _, update in pending]}
+            self._request(
+                "POST", f"/api/runtime/nodes/{self.config.node_id}/file-tree", payload, credential=True,
+            )
+            self.file_tree_index.acknowledge_sync_updates(updates)
+        except HttpStatusError as exc:
+            if exc.status == 401:
+                raise CredentialRejectedError(exc.status) from None
+            LOGGER.warning("file_tree_sync_failed status=%d", exc.status)
+        except (AgentError, DockerError, OSError, TimeoutError) as exc:
+            LOGGER.warning("file_tree_sync_failed error=%s", str(exc)[:220])
 
     def _report_servers(self, sequence: int) -> None:
         assert self.state is not None

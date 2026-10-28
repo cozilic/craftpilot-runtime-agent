@@ -527,6 +527,7 @@ class DockerRuntimeTests(unittest.TestCase):
 
         agent._request = request
         agent._report_servers = lambda _sequence: None
+        agent._sync_file_tree_cache = lambda: None
 
         agent.poll_once()
 
@@ -537,6 +538,50 @@ class DockerRuntimeTests(unittest.TestCase):
                          result_request[1])
         self.assertEqual("ack", ack_request[0])
         self.assertTrue(ack_request[1]["success"])
+
+    def test_file_tree_sync_posts_bounded_deltas_then_acknowledges_them(self):
+        agent = RuntimeNodeAgent(self.config, runtime=self.runtime, store=MemoryStateStore())
+        agent.state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 0}
+        index = agent.file_tree_index
+        index._ready = True
+        index._store_directory(SERVER_ID, 1, [{
+            "name": "worlds", "type": "dir", "size": None, "modified_at": "2026-10-28T10:00:00Z",
+        }])
+        requests = []
+
+        def request(method, path, body, credential=False):
+            self.assertTrue(credential)
+            requests.append((method, path, body))
+            if path.endswith("/servers"):
+                return {"servers": [SERVER_ID]}
+            return {"ok": True}
+
+        agent._request = request
+        agent._sync_file_tree_cache()
+
+        self.assertEqual("GET", requests[0][0])
+        self.assertEqual("POST", requests[1][0])
+        self.assertEqual(SERVER_ID, requests[1][2]["directories"][0]["server_id"])
+        self.assertEqual("", requests[1][2]["directories"][0]["path"])
+        self.assertEqual([], index.pending_sync_updates({SERVER_ID}))
+
+    def test_file_tree_sync_failure_keeps_delta_for_retry(self):
+        agent = RuntimeNodeAgent(self.config, runtime=self.runtime, store=MemoryStateStore())
+        agent.state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 0}
+        index = agent.file_tree_index
+        index._ready = True
+        index._store_directory(SERVER_ID, 1, [])
+
+        def request(_method, path, _body, credential=False):
+            self.assertTrue(credential)
+            if path.endswith("/servers"):
+                return {"servers": [SERVER_ID]}
+            raise agent_module.HttpStatusError(503)
+
+        agent._request = request
+        agent._sync_file_tree_cache()
+
+        self.assertEqual(1, len(index.pending_sync_updates({SERVER_ID})))
 
     def test_file_tree_index_serves_repeated_listing_without_rescanning(self):
         index = FileTreeIndex(self.config.data_root, self.config.state_dir)
@@ -1185,6 +1230,7 @@ class DockerRuntimeTests(unittest.TestCase):
 
         agent._request = request
         agent._report_servers = lambda _sequence: None
+        agent._sync_file_tree_cache = lambda: None
         transfer_error = agent_module.migration_transfer.MigrationTransferError(
             "server data archive from Docker is invalid",
         )

@@ -54,6 +54,8 @@ class FileTreeIndex:
         self._lock = threading.RLock()
         self._directories: dict[str, dict[str, Any]] = {}
         self._dirty: set[str] = set()
+        self._sync_updates: dict[str, tuple[int, dict[str, Any] | None]] = {}
+        self._sync_revision = 0
         self._ready = False
         self._needs_persist = False
         self._last_persist = 0.0
@@ -134,6 +136,41 @@ class FileTreeIndex:
             self._dirty.add(key)
             self._needs_persist = True
 
+    def pending_sync_updates(self, server_ids: set[str], limit: int = 2) -> list[tuple[str, int, dict[str, Any]]]:
+        """Return fresh listing deltas for assigned servers, without consuming them."""
+        with self._lock:
+            if not self._ready:
+                return []
+            dirty_keys = [key for key in self._dirty if key.split("/", 1)[0] in server_ids]
+        for key in dirty_keys:
+            self._refresh_directory(key)
+
+        updates: list[tuple[str, int, dict[str, Any]]] = []
+        with self._lock:
+            for key, (revision, listing) in self._sync_updates.items():
+                server_id, separator, relative = key.partition("/")
+                if server_id not in server_ids:
+                    continue
+                if listing is None:
+                    update = {"server_id": server_id, "path": relative if separator else "", "deleted": True}
+                else:
+                    update = {"server_id": server_id, "path": relative if separator else "", "listing": listing}
+                updates.append((key, revision, update))
+                if len(updates) >= limit:
+                    break
+        return updates
+
+    def acknowledge_sync_updates(self, revisions: list[tuple[str, int]]) -> None:
+        with self._lock:
+            for key, revision in revisions:
+                current = self._sync_updates.get(key)
+                if current is not None and current[0] == revision:
+                    self._sync_updates.pop(key, None)
+
+    def _queue_sync_locked(self, key: str, listing: dict[str, Any] | None) -> None:
+        self._sync_revision += 1
+        self._sync_updates[key] = (self._sync_revision, listing)
+
     def _store_directory(self, key: str, mtime_ns: int, entries: list[dict[str, Any]]) -> None:
         with self._lock:
             self._directories[key] = {"mtime_ns": mtime_ns, "entries": entries}
@@ -141,6 +178,9 @@ class FileTreeIndex:
             if self._ready and self._fd is not None:
                 self._add_watch_for_key(key)
             if self._ready:
+                normalized = key.partition("/")[2] if "/" in key else ""
+                parent = normalized.rpartition("/")[0] if "/" in normalized else ("" if normalized else None)
+                self._queue_sync_locked(key, {"path": normalized, "parent": parent, "entries": entries})
                 self._persist_locked()
                 self._needs_persist = False
                 self._last_persist = time.monotonic()
@@ -406,8 +446,19 @@ class FileTreeIndex:
                     continue
                 self._scan_subtree_fd(server_fd, key, rebuilt, depth=0)
         with self._lock:
+            previous_keys = set(self._directories)
             self._directories = rebuilt
             self._dirty.clear()
+            for removed_key in previous_keys - set(rebuilt):
+                self._queue_sync_locked(removed_key, None)
+            for key, record in rebuilt.items():
+                _server_id, separator, relative = key.partition("/")
+                parent = relative.rpartition("/")[0] if "/" in relative else ("" if separator else None)
+                self._queue_sync_locked(key, {
+                    "path": relative if separator else "",
+                    "parent": parent,
+                    "entries": record["entries"],
+                })
             self._ready = True
             self._persist_locked()
             self._needs_persist = False
@@ -446,6 +497,14 @@ class FileTreeIndex:
         with self._lock:
             self._directories.update(indexed)
             self._dirty.difference_update(indexed)
+            for indexed_key, record in indexed.items():
+                _server_id, separator, relative = indexed_key.partition("/")
+                parent = relative.rpartition("/")[0] if "/" in relative else ("" if separator else None)
+                self._queue_sync_locked(indexed_key, {
+                    "path": relative if separator else "",
+                    "parent": parent,
+                    "entries": record["entries"],
+                })
             self._needs_persist = True
             self._persist_locked()
             self._needs_persist = False
@@ -458,6 +517,7 @@ class FileTreeIndex:
             for path in removed:
                 self._directories.pop(path, None)
                 self._dirty.discard(path)
+                self._queue_sync_locked(path, None)
             if removed:
                 self._needs_persist = True
             watches = [(wd, path) for wd, path in self._watch_paths.items()
@@ -485,6 +545,9 @@ class FileTreeIndex:
             with self._lock:
                 self._directories[key] = {"mtime_ns": info.st_mtime_ns, "entries": entries}
                 self._dirty.discard(key)
+                relative = key.partition("/")[2] if "/" in key else ""
+                parent = relative.rpartition("/")[0] if "/" in relative else ("" if "/" in key else None)
+                self._queue_sync_locked(key, {"path": relative, "parent": parent, "entries": entries})
                 self._add_watch_fd(descriptor, key)
                 self._needs_persist = True
                 self._persist_locked()
