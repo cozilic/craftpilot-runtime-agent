@@ -1361,6 +1361,9 @@ class RuntimeNodeAgent:
         self.config, self.runtime = config, runtime or DockerRuntime(config)
         self.store = store or StateStore(config.state_dir)
         self.file_tree_index = file_tree_index.FileTreeIndex(config.data_root, config.state_dir)
+        self._last_file_tree_progress = self.file_tree_index.progress
+        self._last_reported_file_tree_progress: str | None = None
+        self.file_tree_index.set_progress_callback(self._on_file_tree_progress)
         if isinstance(self.runtime, DockerRuntime):
             self.runtime.file_tree_index = self.file_tree_index
         self.state: dict[str, Any] | None = None
@@ -1638,6 +1641,26 @@ class RuntimeNodeAgent:
         self._report_servers(sequence)
         self._sync_file_tree_cache()
 
+    def _on_file_tree_progress(self, stage: str) -> None:
+        if stage == self._last_file_tree_progress:
+            return
+        self._last_file_tree_progress = stage
+        if stage != "ready":
+            LOGGER.info("file_tree_progress stage=%s", stage)
+            self._report_file_tree_progress(stage)
+
+    def _report_file_tree_progress(self, stage: str) -> None:
+        if stage == self._last_reported_file_tree_progress or self.state is None:
+            return
+        try:
+            self._request(
+                "POST", f"/api/runtime/nodes/{self.config.node_id}/file-tree/progress",
+                {"stage": stage}, credential=True,
+            )
+            self._last_reported_file_tree_progress = stage
+        except (AgentError, DockerError, OSError, TimeoutError) as exc:
+            LOGGER.warning("file_tree_progress_report_failed error=%s", str(exc)[:200])
+
     def _sync_file_tree_cache(self) -> None:
         if self.file_tree_index is None or self.state is None:
             return
@@ -1650,15 +1673,20 @@ class RuntimeNodeAgent:
                     or any(not isinstance(server_id, str) or not UUID_RE.fullmatch(server_id) for server_id in assigned_ids)):
                 raise AgentError("master returned an invalid server assignment list")
             assigned = set(assigned_ids) - set(self._unassigned_server_ids())
-            pending = self.file_tree_index.pending_sync_updates(assigned)
-            if not pending:
-                return
-            updates = [(key, revision) for key, revision, _ in pending]
-            payload = {"directories": [update for _, _, update in pending]}
-            self._request(
-                "POST", f"/api/runtime/nodes/{self.config.node_id}/file-tree", payload, credential=True,
-            )
-            self.file_tree_index.acknowledge_sync_updates(updates)
+            while True:
+                pending = self.file_tree_index.pending_sync_updates(assigned, limit=20)
+                if not pending:
+                    self._report_file_tree_progress(self.file_tree_index.progress)
+                    return
+                stage = self.file_tree_index.progress
+                if stage == "ready":
+                    self._report_file_tree_progress("indexing")
+                updates = [(key, revision) for key, revision, _ in pending]
+                payload = {"directories": [update for _, _, update in pending]}
+                self._request(
+                    "POST", f"/api/runtime/nodes/{self.config.node_id}/file-tree", payload, credential=True,
+                )
+                self.file_tree_index.acknowledge_sync_updates(updates)
         except HttpStatusError as exc:
             if exc.status == 401:
                 raise CredentialRejectedError(exc.status) from None

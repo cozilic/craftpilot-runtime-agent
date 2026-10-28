@@ -547,6 +547,10 @@ class DockerRuntimeTests(unittest.TestCase):
         index._store_directory(SERVER_ID, 1, [{
             "name": "worlds", "type": "dir", "size": None, "modified_at": "2026-10-28T10:00:00Z",
         }])
+        for i in range(55):
+            index._queue_sync_locked(f"{SERVER_ID}/folder-{i}", {
+                "path": f"folder-{i}", "parent": "", "entries": [],
+            })
         requests = []
 
         def request(method, path, body, credential=False):
@@ -554,15 +558,19 @@ class DockerRuntimeTests(unittest.TestCase):
             requests.append((method, path, body))
             if path.endswith("/servers"):
                 return {"servers": [SERVER_ID]}
+            if path.endswith("/file-tree/progress"):
+                return {"ok": True}
             return {"ok": True}
 
         agent._request = request
         agent._sync_file_tree_cache()
 
         self.assertEqual("GET", requests[0][0])
-        self.assertEqual("POST", requests[1][0])
-        self.assertEqual(SERVER_ID, requests[1][2]["directories"][0]["server_id"])
-        self.assertEqual("", requests[1][2]["directories"][0]["path"])
+        batches = [request for request in requests if request[1].endswith("/file-tree")]
+        self.assertEqual(3, len(batches))
+        self.assertLessEqual(len(batches[0][2]["directories"]), 20)
+        self.assertEqual(SERVER_ID, batches[0][2]["directories"][0]["server_id"])
+        self.assertEqual("", batches[0][2]["directories"][0]["path"])
         self.assertEqual([], index.pending_sync_updates({SERVER_ID}))
 
     def test_file_tree_sync_failure_keeps_delta_for_retry(self):
@@ -576,6 +584,8 @@ class DockerRuntimeTests(unittest.TestCase):
             self.assertTrue(credential)
             if path.endswith("/servers"):
                 return {"servers": [SERVER_ID]}
+            if path.endswith("/file-tree/progress"):
+                return {"ok": True}
             raise agent_module.HttpStatusError(503)
 
         agent._request = request

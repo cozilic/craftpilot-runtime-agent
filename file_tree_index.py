@@ -57,6 +57,8 @@ class FileTreeIndex:
         self._sync_updates: dict[str, tuple[int, dict[str, Any] | None]] = {}
         self._sync_revision = 0
         self._ready = False
+        self._progress = "fetching"
+        self._progress_callback: Callable[[str], None] | None = None
         self._needs_persist = False
         self._last_persist = 0.0
         self._started = False
@@ -100,6 +102,26 @@ class FileTreeIndex:
                 pass
             self._root_fd = None
 
+    @property
+    def progress(self) -> str:
+        with self._lock:
+            return self._progress
+
+    def set_progress_callback(self, callback: Callable[[str], None] | None) -> None:
+        with self._lock:
+            self._progress_callback = callback
+
+    def set_progress(self, stage: str, *, force: bool = False) -> None:
+        if stage not in {"fetching", "building", "indexing", "ready"}:
+            raise ValueError("invalid file tree progress stage")
+        with self._lock:
+            if self._progress == stage and not force:
+                return
+            self._progress = stage
+            callback = self._progress_callback
+        if callback is not None:
+            callback(stage)
+
     def wait_until_ready(self, timeout: float = 5.0) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -136,10 +158,10 @@ class FileTreeIndex:
             self._dirty.add(key)
             self._needs_persist = True
 
-    def pending_sync_updates(self, server_ids: set[str], limit: int = 2) -> list[tuple[str, int, dict[str, Any]]]:
-        """Return fresh listing deltas for assigned servers, without consuming them."""
+    def pending_sync_updates(self, server_ids: set[str], limit: int = 50) -> list[tuple[str, int, dict[str, Any]]]:
+        """Return fresh bounded listing deltas, prioritizing each assigned server's root."""
         with self._lock:
-            if not self._ready:
+            if not self._ready or limit <= 0:
                 return []
             dirty_keys = [key for key in self._dirty if key.split("/", 1)[0] in server_ids]
         for key in dirty_keys:
@@ -147,17 +169,19 @@ class FileTreeIndex:
 
         updates: list[tuple[str, int, dict[str, Any]]] = []
         with self._lock:
-            for key, (revision, listing) in self._sync_updates.items():
+            pending = [
+                (key, revision, listing)
+                for key, (revision, listing) in self._sync_updates.items()
+                if key.split("/", 1)[0] in server_ids
+            ]
+            pending.sort(key=lambda update: ("/" in update[0], update[0]))
+            for key, revision, listing in pending[:limit]:
                 server_id, separator, relative = key.partition("/")
-                if server_id not in server_ids:
-                    continue
                 if listing is None:
                     update = {"server_id": server_id, "path": relative if separator else "", "deleted": True}
                 else:
                     update = {"server_id": server_id, "path": relative if separator else "", "listing": listing}
                 updates.append((key, revision, update))
-                if len(updates) >= limit:
-                    break
         return updates
 
     def acknowledge_sync_updates(self, revisions: list[tuple[str, int]]) -> None:
@@ -433,8 +457,10 @@ class FileTreeIndex:
     def _rebuild_all(self) -> None:
         if self._root_fd is None:
             return
+        self.set_progress("fetching")
         root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         rebuilt: dict[str, dict[str, Any]] = {}
+        server_directories: list[tuple[str, int]] = []
         with os.scandir(self._root_fd) as servers:
             for server in servers:
                 if len(server.name) != 36 or server.is_symlink() or not server.is_dir(follow_symlinks=False):
@@ -444,7 +470,11 @@ class FileTreeIndex:
                     server_fd = os.open(server.name, root_flags, dir_fd=self._root_fd)
                 except OSError:
                     continue
-                self._scan_subtree_fd(server_fd, key, rebuilt, depth=0)
+                server_directories.append((key, server_fd))
+        self.set_progress("building")
+        for key, server_fd in server_directories:
+            self._scan_subtree_fd(server_fd, key, rebuilt, depth=0)
+        self.set_progress("indexing", force=True)
         with self._lock:
             previous_keys = set(self._directories)
             self._directories = rebuilt
@@ -463,6 +493,7 @@ class FileTreeIndex:
             self._persist_locked()
             self._needs_persist = False
             self._last_persist = time.monotonic()
+        self.set_progress("ready")
 
     def _scan_subtree_fd(self, directory_fd: int, key: str, output: dict[str, dict[str, Any]], depth: int) -> None:
         try:
