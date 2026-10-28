@@ -260,6 +260,26 @@ class MemoryStateStore:
         self.saved.append(json.loads(json.dumps(state)))
 
 
+class RuntimeNodeSettingsTests(unittest.TestCase):
+    def test_node_settings_update_polling_interval_and_validate_every_field(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent = RuntimeNodeAgent(make_config(Path(directory)), runtime=SimpleNamespace(), store=MemoryStateStore())
+            agent._apply_node_settings({"name": "New node", "max_servers": 9, "poll_interval_seconds": 17})
+            self.assertEqual(17, agent.poll_seconds)
+            self.assertEqual({"name": "New node", "max_servers": 9, "poll_interval_seconds": 17}, agent.node_settings)
+
+            agent._apply_node_settings({"name": "New node", "max_servers": 9, "poll_interval_seconds": 6})
+            self.assertEqual(6, agent.poll_seconds)
+
+            for settings in (
+                {"name": "Node", "max_servers": 1, "poll_interval_seconds": True},
+                {"name": "Node", "max_servers": 1001, "poll_interval_seconds": 5},
+                {"name": "  ", "max_servers": 1, "poll_interval_seconds": 5},
+            ):
+                with self.subTest(settings=settings), self.assertRaises(AgentError):
+                    agent._apply_node_settings(settings)
+
+
 class RuntimeAgentRevocationTests(unittest.TestCase):
     def test_run_forever_does_not_poll_or_exit_after_credential_revocation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -521,7 +541,8 @@ class DockerRuntimeTests(unittest.TestCase):
 
         def request(method, path, body, credential=False):
             if path.endswith("/commands/claim"):
-                return {"command": command}
+                self.assertTrue(credential)
+                return {"command": command, "node_settings": {"name": "Node", "max_servers": 4, "poll_interval_seconds": 11}}
             requests.append((path.rsplit("/", 1)[-1], body))
             return {"ok": True}
 

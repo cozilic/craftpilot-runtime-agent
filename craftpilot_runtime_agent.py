@@ -1371,6 +1371,8 @@ class RuntimeNodeAgent:
         self._last_reported_states: dict[str, str] = {}
         self.pending_enrollment: dict[str, str] | None = None
         self.credential_revoked = False
+        self.poll_seconds = config.poll_seconds
+        self.node_settings: dict[str, Any] = {}
         if isinstance(self.runtime, DockerRuntime):
             self.runtime.state_store = self.store
 
@@ -1563,6 +1565,7 @@ class RuntimeNodeAgent:
         self.state["sequence"] = sequence
         self.store.save(self.state)
         claim = self._request("POST", f"/api/runtime/nodes/{self.config.node_id}/commands/claim", {"sequence": sequence}, credential=True)
+        self._apply_node_settings(claim.get("node_settings"))
         command = claim.get("command")
         if command is None:
             self._report_servers(sequence)
@@ -1968,8 +1971,23 @@ class RuntimeNodeAgent:
             except (AgentError, OSError, TimeoutError) as exc:
                 LOGGER.error("agent_iteration_failed error=%s", str(exc)[:300])
             delay = max(0.0, (15 if self.credential_revoked or self.state is None or self.state.get("enrollment_request_id")
-                              else self.config.poll_seconds) - (time.monotonic() - started))
+                              else self.poll_seconds) - (time.monotonic() - started))
             time.sleep(delay)
+
+    def _apply_node_settings(self, settings: Any) -> None:
+        if not isinstance(settings, dict):
+            return
+        poll_seconds = settings.get("poll_interval_seconds")
+        if isinstance(poll_seconds, bool) or not isinstance(poll_seconds, int) or not 2 <= poll_seconds <= 120:
+            raise AgentError("master returned an invalid node polling interval")
+        name = settings.get("name")
+        max_servers = settings.get("max_servers")
+        if not isinstance(name, str) or not name.strip() or len(name) > 80:
+            raise AgentError("master returned an invalid node name")
+        if isinstance(max_servers, bool) or not isinstance(max_servers, int) or not 1 <= max_servers <= 1000:
+            raise AgentError("master returned an invalid node capacity")
+        self.node_settings = {"name": name, "max_servers": max_servers, "poll_interval_seconds": poll_seconds}
+        self.poll_seconds = poll_seconds
 
     def _request(self, method: str, path: str, body: dict[str, Any], credential: bool = False) -> dict[str, Any]:
         if not path.startswith("/api/") or ".." in path:
