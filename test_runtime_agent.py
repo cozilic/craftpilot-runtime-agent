@@ -873,9 +873,10 @@ class DockerRuntimeTests(unittest.TestCase):
         runtime = DockerRuntime(self.config, FakeDocker(["__missing__"]))
         agent = RuntimeNodeAgent(self.config, runtime=runtime)
 
-        report = agent._server_report(SERVER_ID, 7)
+        report = agent._server_report(SERVER_ID, 7, artifact_check={"jar": "server.jar", "min_bytes": 8})
 
         self.assertEqual("OFFLINE", report["status"])
+        self.assertFalse(report["artifact_present"])
         self.assertIsNone(report["cpu_percent"])
         self.assertIsNone(report["uptime_seconds"])
         self.assertEqual([], report["logs"])
@@ -892,7 +893,7 @@ class DockerRuntimeTests(unittest.TestCase):
         def request(method, path, body, credential=False):
             self.assertTrue(credential)
             if method == "GET" and path.endswith("/servers"):
-                return {"servers": [SERVER_ID]}
+                return {"servers": [SERVER_ID], "artifacts": {SERVER_ID: {"jar": "server.jar", "min_bytes": 8}}}
             if method == "POST" and path.endswith("/servers/report"):
                 reports.append(body)
                 return {"ok": True}
@@ -904,9 +905,34 @@ class DockerRuntimeTests(unittest.TestCase):
         self.assertEqual(1, len(reports))
         self.assertEqual(SERVER_ID, reports[0]["server_id"])
         self.assertEqual("OFFLINE", reports[0]["status"])
+        self.assertFalse(reports[0]["artifact_present"])
+
+    def test_server_report_checks_required_jar_size_and_rejects_symlinks(self):
+        jar_path = self.config.data_root / SERVER_ID / "server.jar"
+        jar_path.write_bytes(b"x" * 8)
+        runtime = DockerRuntime(self.config, FakeDocker(["__missing__"] * 3))
+        agent = RuntimeNodeAgent(self.config, runtime=runtime)
+        check = {"jar": "server.jar", "min_bytes": 8}
+
+        report = agent._server_report(SERVER_ID, 7, artifact_check=check)
+
+        self.assertTrue(report["artifact_present"])
+        jar_path.write_bytes(b"x" * 7)
+        self.assertFalse(agent._server_report(SERVER_ID, 8, artifact_check=check)["artifact_present"])
+        jar_path.unlink()
+        outside = self.root / "outside.jar"
+        outside.write_bytes(b"x" * 16)
+        try:
+            jar_path.symlink_to(outside)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 1314:
+                self.skipTest("Creating a symlink requires Windows developer mode or elevated privileges")
+            raise
+        self.assertFalse(agent._server_report(SERVER_ID, 9, artifact_check=check)["artifact_present"])
 
     def test_server_report_returns_status_metrics_logs_and_data_disk_usage(self):
         (self.config.data_root / SERVER_ID / "existing.txt").write_text("x" * 100)
+        (self.config.data_root / SERVER_ID / "server.jar").write_bytes(b"x" * 8)
         labels = json.dumps({"craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID})
         from datetime import datetime, timedelta, timezone
         start = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
@@ -915,9 +941,12 @@ class DockerRuntimeTests(unittest.TestCase):
             "2026-10-26T10:00:00.000000000Z [Server thread/INFO]: ready",
         ])
         runtime = DockerRuntime(self.config, runner)
-        report = RuntimeNodeAgent(self.config, runtime=runtime)._server_report(SERVER_ID, 7)
+        report = RuntimeNodeAgent(self.config, runtime=runtime)._server_report(
+            SERVER_ID, 7, artifact_check={"jar": "server.jar", "min_bytes": 8},
+        )
 
         self.assertEqual("ONLINE", report["status"])
+        self.assertTrue(report["artifact_present"])
         self.assertEqual(12.5, report["cpu_percent"])
         self.assertEqual(512, report["memory_used_mb"])
         self.assertEqual(2048, report["memory_limit_mb"])
@@ -961,7 +990,7 @@ class DockerRuntimeTests(unittest.TestCase):
         assignment_snapshots = iter([[SERVER_ID], [SERVER_ID], [SERVER_ID]])
         agent._assigned_server_ids = lambda: next(assignment_snapshots)
         report_calls = []
-        agent._server_report = lambda server_id, *_args: report_calls.append(server_id) or {
+        agent._server_report = lambda server_id, *_args, **_kwargs: report_calls.append(server_id) or {
             "server_id": server_id, "sequence": 2, "status": "OFFLINE", "logs": [],
         }
         requests = []
@@ -1015,7 +1044,7 @@ class DockerRuntimeTests(unittest.TestCase):
         assignment_snapshots = iter([[SERVER_ID], [SERVER_ID], [SERVER_ID]])
         agent._assigned_server_ids = lambda: next(assignment_snapshots)
         report_calls = []
-        agent._server_report = lambda server_id, *_args: report_calls.append(server_id) or {
+        agent._server_report = lambda server_id, *_args, **_kwargs: report_calls.append(server_id) or {
             "server_id": server_id, "sequence": 2, "status": "OFFLINE", "logs": [],
         }
         responses = iter([
@@ -1037,11 +1066,11 @@ class DockerRuntimeTests(unittest.TestCase):
         self.assertEqual([SERVER_ID], report_calls)
         self.assertIn(SERVER_ID, state["unassigned_servers"])
         self.assertTrue(any("server_report_suppressed" in message and SERVER_ID in message for message in captured.output))
-        agent._server_report = lambda server_id, sequence, *_args: {
+        agent._server_report = lambda server_id, sequence, *_args, **_kwargs: {
             "server_id": server_id, "sequence": sequence, "status": "OFFLINE", "logs": [],
         }
         agent._request = lambda method, path, *_args, **_kwargs: (
-            {"servers": []} if path.endswith("/servers") else {"ok": True}
+            {"servers": [], "artifacts": {}} if path.endswith("/servers") else {"ok": True}
         )
         agent._assigned_server_ids = lambda: [SERVER_ID]
         agent._report_servers(4)
@@ -1170,10 +1199,14 @@ class DockerRuntimeTests(unittest.TestCase):
                     return SimpleNamespace(returncode=1, stdout="", stderr="du unavailable")
                 raise AssertionError(args)
 
+        (self.config.data_root / SERVER_ID / "server.jar").write_bytes(b"x" * 8)
         runner = PartiallyFailingDocker(["true", labels, "running", "2026-10-26T10:00:00Z|0|123"])
-        report = RuntimeNodeAgent(self.config, runtime=DockerRuntime(self.config, runner))._server_report(SERVER_ID, 8)
+        report = RuntimeNodeAgent(self.config, runtime=DockerRuntime(self.config, runner))._server_report(
+            SERVER_ID, 8, artifact_check={"jar": "server.jar", "min_bytes": 8},
+        )
 
         self.assertEqual("ONLINE", report["status"])
+        self.assertTrue(report["artifact_present"])
         self.assertIsNone(report["cpu_percent"])
         self.assertIsNone(report["memory_used_mb"])
         self.assertEqual([], report["logs"])

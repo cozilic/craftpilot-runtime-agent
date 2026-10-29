@@ -1709,10 +1709,26 @@ class RuntimeNodeAgent:
                 "GET", f"/api/runtime/nodes/{self.config.node_id}/servers", {}, credential=True,
             )
             assigned_server_ids = assigned_response.get("servers")
+            artifact_checks = assigned_response.get("artifacts", {})
             if (not isinstance(assigned_server_ids, list)
                     or any(not isinstance(server_id, str) or not UUID_RE.fullmatch(server_id)
                            for server_id in assigned_server_ids)):
                 raise AgentError("master returned an invalid server assignment list")
+            if not isinstance(artifact_checks, dict):
+                raise AgentError("master returned invalid artifact requirements")
+            for server_id, check in artifact_checks.items():
+                if (not isinstance(server_id, str) or not UUID_RE.fullmatch(server_id)
+                        or not isinstance(check, dict)
+                        or not isinstance(check.get("jar"), str)
+                        or not check["jar"] or check["jar"] in (".", "..")
+                        or "/" in check["jar"] or "\\" in check["jar"]
+                        or any(ord(character) < 32 or ord(character) == 127 for character in check["jar"])
+                        or isinstance(check.get("min_bytes"), bool)
+                        or not isinstance(check.get("min_bytes"), int)
+                        or not 0 <= check["min_bytes"] <= 2**63 - 1):
+                    raise AgentError("master returned an invalid artifact requirement")
+            if any(server_id not in assigned_server_ids for server_id in artifact_checks):
+                raise AgentError("master returned artifact requirements for an unassigned server")
         except HttpStatusError as exc:
             if exc.status == 401:
                 raise
@@ -1737,7 +1753,7 @@ class RuntimeNodeAgent:
             if cursor is not None and (not isinstance(cursor, str) or not LOG_TIMESTAMP_RE.fullmatch(cursor)):
                 raise AgentError("saved runtime log cursor is invalid")
             try:
-                report = self._server_report(server_id, sequence, cursor)
+                report = self._server_report(server_id, sequence, cursor, artifact_checks.get(server_id))
                 if report is None:
                     continue
                 self._request("POST", f"/api/runtime/nodes/{self.config.node_id}/servers/report", report, credential=True)
@@ -1808,7 +1824,10 @@ class RuntimeNodeAgent:
                 server_ids.add(server_id.lower())
         return sorted(server_ids)
 
-    def _server_report(self, server_id: str, sequence: int, log_since: str | None = None) -> dict[str, Any] | None:
+    def _server_report(
+        self, server_id: str, sequence: int, log_since: str | None = None,
+        artifact_check: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         if not UUID_RE.fullmatch(server_id):
             return None
         name = f"craftpilot-{server_id.replace('-', '')[:8]}"
@@ -1824,7 +1843,8 @@ class RuntimeNodeAgent:
                 "sequence": sequence, "server_id": server_id, "status": "OFFLINE",
                 "cpu_percent": None, "memory_used_mb": None, "memory_limit_mb": None,
                 "uptime_seconds": None, "players_online": None, "players_max": None,
-                "disk_used_mb": self.runtime._server_disk_used_mb(server_id), "logs": [],
+                "disk_used_mb": self.runtime._server_disk_used_mb(server_id),
+                "artifact_present": self._artifact_present(server_id, artifact_check), "logs": [],
             }
         self.runtime._verify_managed(server_id, name)
         state = self.runtime._inspect(name, "{{.State.Status}}")
@@ -1867,7 +1887,26 @@ class RuntimeNodeAgent:
         return {"sequence": sequence, "server_id": server_id, "status": status, "cpu_percent": cpu_percent,
                 "memory_used_mb": memory_used_mb, "memory_limit_mb": memory_limit_mb,
                 "uptime_seconds": self._uptime_seconds(started_at) if running == "true" else None,
-                "players_online": None, "players_max": None, "disk_used_mb": disk_used_mb, "logs": logs}
+                "players_online": None, "players_max": None, "disk_used_mb": disk_used_mb,
+                "artifact_present": self._artifact_present(server_id, artifact_check), "logs": logs}
+
+    def _artifact_present(self, server_id: str, check: dict[str, Any] | None) -> bool | None:
+        if check is None:
+            return None
+        try:
+            descriptor, _normalized = self.runtime._open_server_file(server_id, check["jar"])
+            if isinstance(descriptor, Path):
+                info = descriptor.lstat()
+                return stat.S_ISREG(info.st_mode) and info.st_size >= check["min_bytes"]
+            try:
+                info = os.fstat(descriptor)
+                return stat.S_ISREG(info.st_mode) and info.st_size >= check["min_bytes"]
+            finally:
+                os.close(descriptor)
+        except FileNotFoundError:
+            return False
+        except (AgentError, OSError, KeyError, TypeError):
+            return None
 
     @staticmethod
     def _parse_docker_stats(output: str) -> tuple[float | None, int | None, int | None]:
