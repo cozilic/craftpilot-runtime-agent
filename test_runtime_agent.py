@@ -505,6 +505,34 @@ class DockerRuntimeTests(unittest.TestCase):
             self.runtime.execute("snapshot", payload, credential="c" * 64, command_id=command_id)
         self.assertEqual(["existing.txt"], [path.name for path in (self.config.data_root / SERVER_ID).iterdir()])
 
+    def test_remote_file_write_mutation_passes_parent_descriptor_to_atomic_writer(self):
+        command_id = "f1d64bb9-2585-4d7e-b0e2-463732a212ac"
+        with patch.object(self.runtime, "_open_server_parent", return_value=(42, "server.properties")) as open_parent:
+            with patch.object(self.runtime, "_atomic_write_at") as atomic_write:
+                with patch.object(agent_module.os, "close") as close:
+                    result = self.runtime.execute("file_mutate", {
+                        "server_id": SERVER_ID,
+                        "operation": "write",
+                        "path": "server.properties",
+                        "content": "motd=new\\n",
+                    }, credential="c" * 64, command_id=command_id)
+
+        self.assertEqual("FILE_MUTATED", result["result_code"])
+        self.assertEqual({"operation": "write", "ok": True}, result["result"])
+        open_parent.assert_called_once_with(SERVER_ID, "server.properties", allow_root=False)
+        atomic_write.assert_called_once_with(42, "server.properties", b"motd=new\\n")
+        close.assert_called_once_with(42)
+
+    def test_remote_file_write_mutation_rejects_path_traversal(self):
+        command_id = "f1d64bb9-2585-4d7e-b0e2-463732a212ac"
+        with self.assertRaises(AgentError):
+            self.runtime.execute("file_mutate", {
+                "server_id": SERVER_ID,
+                "operation": "write",
+                "path": "../outside.txt",
+                "content": "unsafe",
+            }, credential="c" * 64, command_id=command_id)
+
     def test_remote_file_upload_mutation_returns_verified_size_and_digest(self):
         payload = {
             "operation": "upload",

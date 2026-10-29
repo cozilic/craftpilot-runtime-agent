@@ -587,8 +587,7 @@ class DockerRuntime:
             content = payload.get("content")
             if not isinstance(content, str) or len(content.encode("utf-8")) > 4 * 1024 * 1024:
                 raise AgentError("remote text content is invalid or too large")
-            descriptor, normalized = self._open_server_parent(server_id, relative, allow_root=False)
-            parent_fd, name = descriptor
+            parent_fd, name = self._open_server_parent(server_id, relative, allow_root=False)
             try:
                 self._atomic_write_at(parent_fd, name, content.encode("utf-8"))
             finally:
