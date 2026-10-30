@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/craftpilot-runtime-agent-logo.png" alt="CraftPilot Runtime Agent" width="720">
+</p>
+
 # CraftPilot Runtime Agent
 
 The CraftPilot Runtime Agent connects a trusted Linux host to a CraftPilot master so Minecraft servers can run on infrastructure you control. It communicates with the master over HTTPS and manages Minecraft containers through the host’s Docker daemon.
