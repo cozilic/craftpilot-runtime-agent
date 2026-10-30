@@ -15,8 +15,9 @@ services:
       - CHOWN
       - DAC_OVERRIDE
       - FOWNER
+    # Linux setup detects the socket GID; Desktop setup probes the mounted socket.
     group_add:
-      - "${DOCKER_GID:?Set DOCKER_GID to the numeric group ID of /var/run/docker.sock}"
+      - "${DOCKER_GID:-0}"
       - "33"
     command:
       - /bin/sh
@@ -29,17 +30,17 @@ services:
       CRAFTPILOT_AGENT_STATE_DIR: /var/lib/craftpilot-agent
       CRAFTPILOT_SERVER_DATA_ROOT: /srv/craftpilot/servers
       # The Docker daemon must see this exact host path for child server mounts.
-      CRAFTPILOT_DOCKER_SERVER_DATA_ROOT: ${CRAFTPILOT_SERVER_DATA_HOST_PATH:-/srv/craftpilot/servers}
+      CRAFTPILOT_DOCKER_SERVER_DATA_ROOT: "${CRAFTPILOT_DOCKER_SERVER_DATA_ROOT:-${CRAFTPILOT_SERVER_DATA_HOST_PATH:-/srv/craftpilot/servers}}"
       CRAFTPILOT_SERVER_DATA_GID: ${CRAFTPILOT_SERVER_DATA_GID:-33}
       CRAFTPILOT_DOCKER_NETWORK: ${CRAFTPILOT_DOCKER_NETWORK:-craftpilot-servers}
       CRAFTPILOT_LOG_LEVEL: ${CRAFTPILOT_LOG_LEVEL:-INFO}
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - "${CRAFTPILOT_DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock"
       - agent_state:/var/lib/craftpilot-agent
       - type: bind
-        source: ${CRAFTPILOT_SERVER_DATA_HOST_PATH:-/srv/craftpilot/servers}
+        source: "${CRAFTPILOT_SERVER_DATA_HOST_PATH:-/srv/craftpilot/servers}"
         target: /srv/craftpilot/servers
-    # Run only on a trusted, dedicated Linux node; never expose Docker socket over TCP.
+    # Run only on a trusted host; Docker socket access is effectively host-root control.
 
 volumes:
   agent_state:
