@@ -8,6 +8,9 @@ The CraftPilot Runtime Agent connects a trusted host to a CraftPilot master so M
 
 > **Security warning:** The agent mounts the Docker socket, which grants effectively host-root control. Run it only on a trusted, dedicated host. Never expose the Docker socket over TCP, and protect the agent’s state volume and configuration as secrets.
 
+> ## 🚨 Tested on Linux only
+> **Only the Linux installation has been tested.** The macOS and Windows/WSL 2 setup instructions and launchers are included, but have **not been tested end to end** on those platforms.
+
 ## What it supports
 
 The current agent supports a focused set of operations:
@@ -26,8 +29,6 @@ Use a trusted host with:
 - A supported operating system: Linux, macOS with Docker Desktop, or Windows 10/11 with WSL 2 and Docker Desktop’s WSL integration.
 - Docker Engine 19.03 or later, Docker Compose v2, and Docker Buildx 0.17.0 or later. Docker Desktop includes these tools on macOS and Windows.
 - HTTPS access to the CraftPilot master.
-
-> **Platform testing status:** Only the Linux installation has been tested. The macOS and Windows/WSL 2 instructions and launchers are provided but have not yet been validated end to end on those platforms.
 
 The runtime container includes Python 3.13 and the Docker CLI; Python does not need to be installed on the host. The Docker daemon must manage both the agent and Minecraft containers, and must see the server-data path passed to Minecraft containers.
 
@@ -161,7 +162,7 @@ Do not use `docker compose down -v` unless you intend to remove the saved agent 
 
 ## Testing
 
-Run the setup preflight tests from the repository root. These checks are shell-based; this does not mean the macOS or Windows/WSL installation has been tested:
+Run the setup preflight tests from the repository root. These shell-based checks do **not** mean that macOS or Windows/WSL installation has been tested.
 
 ```sh
 sh test_setup_resources.sh
