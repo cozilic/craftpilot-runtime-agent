@@ -1,6 +1,6 @@
 services:
   runtime-agent:
-    image: craftpilot-runtime-agent:local
+    image: craftpilot-runtime-agent:latest
     build:
       context: .
       dockerfile: Dockerfile
