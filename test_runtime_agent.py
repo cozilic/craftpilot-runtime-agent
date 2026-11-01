@@ -1500,5 +1500,94 @@ class DockerRuntimeTests(unittest.TestCase):
                 self.assertFalse(any(call[:3] == ["docker", "run", "--detach"] for call in runner.calls))
 
 
+class ConsoleTickTests(unittest.TestCase):
+    """Den snabba konsol-ticken: join-raden ska ge grindkommandot direkt."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.config = make_config(Path(self.temporary.name))
+        self.config.data_root.mkdir(parents=True, exist_ok=True)
+
+    def _online_report(self, sequence: int) -> dict[str, object]:
+        return {
+            "sequence": sequence, "server_id": SERVER_ID, "status": "ONLINE",
+            "cpu_percent": 1.0, "memory_used_mb": 512, "memory_limit_mb": 2048,
+            "uptime_seconds": 120, "players_online": None, "players_max": None,
+            "disk_used_mb": 12, "artifact_present": None,
+        }
+
+    def test_console_tick_sends_join_line_then_claims_the_gate_command(self):
+        command_id = "5d1b3b04-2bea-4a4e-9d2f-0a1f5c5c1a11"
+        join_line = {"ts": "2026-10-26T10:00:05.000000000Z",
+                     "text": "[Server thread/INFO]: Steve joined the game"}
+        events: list[tuple[str, dict]] = []
+        executed = []
+
+        class FakeRuntime:
+            config = self.config
+
+            def _container_logs(self, name, since=None):
+                return [] if since is not None else [dict(join_line)]
+
+            def execute(self, command_type, payload, credential=None, command_id=None):
+                executed.append((command_type, payload))
+                return {"success": True, "result_code": "CONSOLE_EXECUTED"}
+
+        agent = RuntimeNodeAgent(self.config, runtime=FakeRuntime(), store=MemoryStateStore())
+        agent.state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 4}
+        agent._last_reports[SERVER_ID] = self._online_report(4)
+        settings = {"name": "Node", "max_servers": 4, "poll_interval_seconds": 5}
+
+        gate_commands = [
+            {"id": "d1c2e3f4-1111-4222-8333-944455556666", "lease_token": "l" * 64, "type": "console",
+             "payload": {"server_id": SERVER_ID, "command": "tellraw Steve \"!accept\""}},
+            {"id": command_id, "lease_token": "l" * 64, "type": "console",
+             "payload": {"server_id": SERVER_ID, "command": "gamemode adventure Steve"}},
+        ]
+        claims = []
+
+        def request(method, path, body, credential=False):
+            self.assertTrue(credential)
+            if path.endswith("/servers/report"):
+                events.append(("report", body))
+                return {"ok": True}
+            if path.endswith("/commands/claim"):
+                events.append(("claim", body))
+                claims.append(body)
+                queued = gate_commands[len(claims) - 1] if len(claims) <= len(gate_commands) else None
+                return {"command": queued, "node_settings": settings}
+            events.append(("ack", body))
+            return {"ok": True}
+
+        agent._request = request
+        agent._console_tick()
+
+        self.assertEqual(["report", "claim"], [kind for kind, _ in events][:2])
+        self.assertEqual("ONLINE", events[0][1]["status"])
+        self.assertEqual([join_line], events[0][1]["logs"])
+        self.assertEqual(
+            [
+                ("console", {"server_id": SERVER_ID, "command": "tellraw Steve \"!accept\""}),
+                ("console", {"server_id": SERVER_ID, "command": "gamemode adventure Steve"}),
+            ],
+            executed,
+        )
+        self.assertEqual(join_line["ts"], agent.state["log_cursors"][SERVER_ID])
+
+    def test_console_tick_skips_the_master_when_no_server_is_online(self):
+        calls = []
+        agent = RuntimeNodeAgent(
+            self.config, runtime=SimpleNamespace(config=self.config), store=MemoryStateStore(),
+        )
+        agent.state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 4}
+        agent._last_reports[SERVER_ID] = {"server_id": SERVER_ID, "status": "STOPPING"}
+        agent._request = lambda *args, **kwargs: calls.append(args)
+
+        agent._console_tick()
+
+        self.assertEqual([], calls)
+
+
 if __name__ == "__main__":
     unittest.main()

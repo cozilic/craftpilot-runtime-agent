@@ -38,6 +38,16 @@ USER_RE = re.compile(r"^[0-9]{1,10}:[0-9]{1,10}$")
 LOG_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$")
 LOGGER = logging.getLogger("craftpilot.runtime_agent")
 
+# Snabb tick medan noden har minst en ONLINE-server: nya konsolrader skickas och
+# masterns svar (regelgrind, chatt-triggers) hämtas direkt i stället för att
+# vänta på nästa fulla poll. Annars kunde en spelare bygga och förstöra i upp
+# till två poll-intervall innan regelgrindens adventure-lås hann fram.
+CONSOLE_TICK_SECONDS = 1.0
+
+# Ett join köar två kommandon (prompt + adventure-lås). Ticken tömmer kön direkt
+# i stället för ett kommando per poll, så låset gäller samma sekund.
+CONSOLE_TICK_MAX_COMMANDS = 4
+
 DEFAULT_IMAGES = frozenset({
     "eclipse-temurin:8-jre", "eclipse-temurin:11-jre", "eclipse-temurin:17-jre",
     "eclipse-temurin:21-jre", "eclipse-temurin:25-jre",
@@ -1368,6 +1378,7 @@ class RuntimeNodeAgent:
         self.state: dict[str, Any] | None = None
         self._opener = urllib.request.build_opener(_NoRedirectHandler())
         self._last_reported_states: dict[str, str] = {}
+        self._last_reports: dict[str, dict[str, Any]] = {}
         self.pending_enrollment: dict[str, str] | None = None
         self.credential_revoked = False
         self.poll_seconds = config.poll_seconds
@@ -1621,26 +1632,59 @@ class RuntimeNodeAgent:
         return True
 
     def poll_once(self) -> None:
-        if self.state is None or (self.state is not None and self.state.get("enrollment_request_id")):
-            if self.state is not None and self.state.get("enrollment_request_id"):
-                if not self._complete_dynamic_enrollment():
-                    return
-            elif not self.ensure_registered():
-                self.poll_enrollment_once()
-                return
+        if self._claim_and_execute() == "not-ready":
+            return
+        assert self.state is not None
+        self._report_servers(self.state["sequence"])
+        self._sync_file_tree_cache()
+
+    def _console_tick(self) -> None:
+        """Snabb tick mellan de vanliga pollarna (se CONSOLE_TICK_SECONDS).
+
+        Nya konsolrader skickas först, kommandon hämtas direkt efter. Ordningen
+        är poängen: serverns join-rad får mastern att köa regelgrindens prompt
+        och adventure-lås, och de kommandona hämtas i samma tick i stället för
+        på nästa poll. Utan det kunde en spelare bygga och förstöra i upp till
+        två poll-intervall innan låset hann fram.
+        """
+        if self.state is None:
+            return
+        if not any(report.get("status") == "ONLINE" for report in self._last_reports.values()):
+            return
+        self._report_log_lines(self._bump_sequence())
+        executed = 0
+        while executed < CONSOLE_TICK_MAX_COMMANDS and self._claim_and_execute() == "executed":
+            executed += 1
+
+    def _bump_sequence(self) -> int:
         assert self.state is not None
         sequence = self.state["sequence"] + 1
         if sequence > 2147483647:
             raise AgentError("heartbeat sequence exhausted; re-enroll this node")
         self.state["sequence"] = sequence
         self.store.save(self.state)
+        return sequence
+
+    def _claim_and_execute(self) -> str:
+        """Hämtar ett kommandolease och kör det.
+
+        Returnerar "not-ready" när noden inte är registrerad, "idle" när mastern
+        inte hade något kommando och "executed" när ett kommando kördes — den
+        sista låter anroparen tömma en kö med flera kommandon direkt.
+        """
+        if self.state is None or (self.state is not None and self.state.get("enrollment_request_id")):
+            if self.state is not None and self.state.get("enrollment_request_id"):
+                if not self._complete_dynamic_enrollment():
+                    return "not-ready"
+            elif not self.ensure_registered():
+                self.poll_enrollment_once()
+                return "not-ready"
+        sequence = self._bump_sequence()
         claim = self._request("POST", f"/api/runtime/nodes/{self.config.node_id}/commands/claim", {"sequence": sequence}, credential=True)
         self._apply_node_settings(claim.get("node_settings"))
         command = claim.get("command")
         if command is None:
-            self._report_servers(sequence)
-            self._sync_file_tree_cache()
-            return
+            return "idle"
         if not isinstance(command, dict):
             raise AgentError("master returned an invalid command")
         command_id, lease_token = command.get("id"), command.get("lease_token")
@@ -1711,8 +1755,7 @@ class RuntimeNodeAgent:
         if result.get("success"):
             LOGGER.info("command_completed command_id=%s type=%s server_id=%s result=%s",
                         command_id, command_type, command_server_id, result.get("result_code", "unknown"))
-        self._report_servers(sequence)
-        self._sync_file_tree_cache()
+        return "executed"
 
     def _on_file_tree_progress(self, stage: str) -> None:
         if stage == self._last_file_tree_progress:
@@ -1768,10 +1811,7 @@ class RuntimeNodeAgent:
             LOGGER.warning("file_tree_sync_failed error=%s", str(exc)[:220])
 
     def _report_servers(self, sequence: int) -> None:
-        assert self.state is not None
-        cursors = self.state.setdefault("log_cursors", {})
-        if not isinstance(cursors, dict):
-            raise AgentError("saved runtime log cursors are invalid")
+        cursors = self._log_cursors()
         unassigned_servers = self._unassigned_server_ids()
         try:
             server_ids = self._assigned_server_ids()
@@ -1826,6 +1866,10 @@ class RuntimeNodeAgent:
                 report = self._server_report(server_id, sequence, cursor, artifact_checks.get(server_id))
                 if report is None:
                     continue
+                # Senaste rapporten per server, utan loggrader: den snabba
+                # konsol-ticken återanvänder status/mätvärden och skickar bara
+                # färska rader.
+                self._last_reports[server_id] = {key: value for key, value in report.items() if key != "logs"}
                 self._request("POST", f"/api/runtime/nodes/{self.config.node_id}/servers/report", report, credential=True)
                 previous_status = self._last_reported_states.get(server_id)
                 if report["status"] != previous_status:
@@ -1847,6 +1891,55 @@ class RuntimeNodeAgent:
             except (AgentError, DockerError, OSError, TimeoutError) as exc:
                 LOGGER.warning("server_report_failed server_id=%s error=%s", server_id, str(exc)[:220])
                 continue
+
+    def _log_cursors(self) -> dict[str, str]:
+        assert self.state is not None
+        cursors = self.state.setdefault("log_cursors", {})
+        if not isinstance(cursors, dict):
+            raise AgentError("saved runtime log cursors are invalid")
+        return cursors
+
+    def _report_log_lines(self, sequence: int) -> None:
+        """Skickar bara nya konsolrader för servrar som redan rapporterats ONLINE.
+
+        Rapporten har samma form som en full telemetrirapport (mastern validerar
+        den), men status och mätvärden återanvänds från senaste rapporten — bara
+        loggraderna är färska. Det gör ticken billig nog att köras varje sekund,
+        och det är de här raderna som låter mastern köa regelgrindens kommandon
+        direkt när en spelare loggar in.
+        """
+        assert self.state is not None
+        cursors = self._log_cursors()
+        for server_id, cached in list(self._last_reports.items()):
+            if cached.get("status") != "ONLINE":
+                continue
+            name = f"craftpilot-{server_id.replace('-', '')[:8]}"
+            if not CONTAINER_RE.fullmatch(name):
+                continue
+            cursor = cursors.get(server_id)
+            if cursor is not None and (not isinstance(cursor, str) or not LOG_TIMESTAMP_RE.fullmatch(cursor)):
+                raise AgentError("saved runtime log cursor is invalid")
+            try:
+                logs = self.runtime._container_logs(name, cursor)
+            except (DockerError, OSError, TimeoutError):
+                continue
+            if not logs:
+                continue
+            report = {**cached, "sequence": sequence, "logs": logs}
+            try:
+                self._request("POST", f"/api/runtime/nodes/{self.config.node_id}/servers/report", report, credential=True)
+            except HttpStatusError as exc:
+                if exc.status == 401:
+                    raise
+                if exc.status == 404:
+                    self._last_reports.pop(server_id, None)
+                LOGGER.warning("console_lines_report_failed server_id=%s status=%d", server_id, exc.status)
+                continue
+            except (AgentError, OSError, TimeoutError) as exc:
+                LOGGER.warning("console_lines_report_failed server_id=%s error=%s", server_id, str(exc)[:220])
+                continue
+            cursors[server_id] = logs[-1]["ts"]
+            self.store.save(self.state)
 
     def _unassigned_server_ids(self) -> list[str]:
         assert self.state is not None
@@ -2079,9 +2172,28 @@ class RuntimeNodeAgent:
                     LOGGER.warning("master_request_failed status=%d retrying", exc.status)
             except (AgentError, OSError, TimeoutError) as exc:
                 LOGGER.error("agent_iteration_failed error=%s", str(exc)[:300])
-            delay = max(0.0, (15 if self.credential_revoked or self.state is None or self.state.get("enrollment_request_id")
-                              else self.poll_seconds) - (time.monotonic() - started))
+            unregistered = self.credential_revoked or self.state is None or self.state.get("enrollment_request_id")
+            interval = 15 if unregistered else self.poll_seconds
+            if not unregistered:
+                self._console_ticks_until(started + interval)
+            delay = max(0.0, interval - (time.monotonic() - started))
             time.sleep(delay)
+
+    def _console_ticks_until(self, deadline: float) -> None:
+        """Kör snabba konsol-tickar fram till nästa fulla poll."""
+        while time.monotonic() + CONSOLE_TICK_SECONDS <= deadline:
+            time.sleep(max(0.0, min(CONSOLE_TICK_SECONDS, deadline - time.monotonic())))
+            try:
+                self._console_tick()
+            except CredentialRejectedError:
+                self._mark_credential_revoked()
+                return
+            except HttpStatusError as exc:
+                LOGGER.warning("console_tick_failed status=%d", exc.status)
+                return
+            except (AgentError, OSError, TimeoutError) as exc:
+                LOGGER.warning("console_tick_failed error=%s", str(exc)[:220])
+                return
 
     def _apply_node_settings(self, settings: Any) -> None:
         if not isinstance(settings, dict):
