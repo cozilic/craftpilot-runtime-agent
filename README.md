@@ -90,6 +90,25 @@ docker compose logs -f runtime-agent
 
 Do not run the Linux `setup.sh` from PowerShell or execute the Compose project from a Windows-mounted `/mnt/c` checkout; Linux socket and sibling-container data mounts require the WSL filesystem and Docker integration.
 
+### Force setup past a preflight failure (`--force`)
+
+If a preflight check blocks setup on a host you still want to use, every setup script can continue anyway:
+
+```sh
+sh setup.sh --force                                  # Linux
+docker compose up -d --build
+sh setup-macos.sh --force                            # macOS (builds and starts)
+```
+
+```powershell
+.\setup-windows.ps1 -Force                           # Windows/WSL
+.\setup-windows.ps1 -Local -CaFile C:\Projects\CraftPilot\runtime-agent\local-certs\ca.crt -Force
+```
+
+`--force` downgrades environment checks to warnings: low available memory or disk, a missing `/etc/os-release`, Docker Engine or Buildx below the required version, the Docker Desktop file-sharing and bind-mount probes, a missing local CraftPilot network, and the package/plugin install prompts (auto-approved, so it also works without a TTY).
+
+It never bypasses the safety checks: `.env` must not be a symlink, the server-data path may not be a system directory, contain `.`/`..` components, or traverse a symlink, unsafe characters are still rejected, and the script still refuses to run on the wrong operating system. Forcing past a real problem produces an agent that starts but can fail later — a data mount Docker Desktop cannot see, or too little memory for the servers you assign. Fix the reported condition afterwards; the checks run and report again on every rerun.
+
 ## Test against a local CraftPilot (`--local`)
 
 Instead of pointing at the production master, one checkout can talk to a CraftPilot stack running on the same machine. Every setup script takes a mode: `--deploy` (the default, `CRAFTPILOT_MASTER_URL=https://craftpilot.se`) or `--local`, which rewrites `CRAFTPILOT_MASTER_URL` and the local CA in `.env`. Rerunning the script switches modes, so no separate `.env` files or hand edits are needed.

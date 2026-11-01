@@ -14,10 +14,12 @@ cd "$SCRIPT_DIR"
 
 MODE=deploy
 LOCAL_CA_FILE=
+FORCE=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --local) MODE=local ;;
     --deploy) MODE=deploy ;;
+    --force) FORCE=true ;;
     --ca-file)
       [ "$#" -ge 2 ] || fail "--ca-file requires a path."
       LOCAL_CA_FILE=$2
@@ -26,12 +28,15 @@ while [ "$#" -gt 0 ]; do
     --ca-file=*) LOCAL_CA_FILE=${1#--ca-file=} ;;
     -h|--help)
       printf '%s\n' \
-        "Usage: sh setup-macos.sh [--local | --deploy] [--ca-file <path>]" \
+        "Usage: sh setup-macos.sh [--local | --deploy] [--ca-file <path>] [--force]" \
         "" \
         "  (no flag), --deploy   Connect to the production master (default)." \
         "  --local               Connect to a CraftPilot stack on this Mac;" \
         "                        needs --ca-file <CraftPilot/runtime-agent/local-certs/ca.crt>." \
-        "  --ca-file <path>      CA used to verify the local CraftPilot master."
+        "  --ca-file <path>      CA used to verify the local CraftPilot master." \
+        "  --force               Continue past the Docker Desktop file-sharing and" \
+        "                        buildx checks when they report a problem. Safety" \
+        "                        checks (.env symlink, server-data path) still apply."
       exit 0
       ;;
     *) fail "Unknown option: $1 (run with --help)" ;;
@@ -45,8 +50,8 @@ fi
 MASTER_URL=${CRAFTPILOT_DEPLOY_MASTER_URL:-https://craftpilot.se}
 if [ "$MODE" = local ]; then
   MASTER_URL=${CRAFTPILOT_LOCAL_MASTER_URL:-https://runtime-tls}
-  [ -n "$LOCAL_CA_FILE" ] || fail "--local needs the local CraftPilot CA: pass --ca-file <CraftPilot/runtime-agent/local-certs/ca.crt>."
-  [ -f "$LOCAL_CA_FILE" ] && [ -r "$LOCAL_CA_FILE" ] && [ ! -L "$LOCAL_CA_FILE" ] || fail "The local CA must be a readable regular file (not a symlink): $LOCAL_CA_FILE"
+  [ -n "$LOCAL_CA_FILE" ] || fail "--local needs the local CraftPilot CA: pass --ca-file <CraftPilot/runtime-agent/local-certs/ca.crt>. It is generated in the CraftPilot checkout by runtime-agent/create-local-certs.sh."
+  [ -f "$LOCAL_CA_FILE" ] && [ -r "$LOCAL_CA_FILE" ] && [ ! -L "$LOCAL_CA_FILE" ] || fail "The local CA must be a readable regular file (not a symlink): $LOCAL_CA_FILE (generated in the CraftPilot checkout by runtime-agent/create-local-certs.sh)"
 fi
 
 set_env_value() {
@@ -66,7 +71,13 @@ set_env_value() {
 command -v docker >/dev/null 2>&1 || fail "Docker CLI not found. Install Docker Desktop for Mac: https://docs.docker.com/desktop/setup/install/mac-install/"
 docker info >/dev/null 2>&1 || fail "Docker Desktop is not running. Start it and enable Linux containers."
 docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is required; update Docker Desktop."
-docker buildx version >/dev/null 2>&1 || fail "Docker Buildx is required; update Docker Desktop."
+if ! docker buildx version >/dev/null 2>&1; then
+  if [ "$FORCE" = true ]; then
+    echo "WARNING: Docker Buildx is unavailable; continuing because --force was given. Update Docker Desktop if the image build fails." >&2
+  else
+    fail "Docker Buildx is required; update Docker Desktop."
+  fi
+fi
 
 [ ! -L .env ] || fail ".env must not be a symbolic link; refusing to overwrite its target."
 [ ! -e .env ] || [ -f .env ] || fail ".env exists but is not a regular file."
@@ -104,10 +115,21 @@ trap cleanup EXIT HUP INT TERM
 
 # Discover Docker Desktop's daemon-side path for this host directory.
 if ! docker create --name "$PROBE_CONTAINER" --mount "type=bind,source=$DATA_PATH,target=/probe" alpine:3.21 sleep 60 >/dev/null 2>&1; then
-  fail "Docker Desktop cannot share '$DATA_PATH'. Add it in Docker Desktop > Settings > Resources > File Sharing."
+  if [ "$FORCE" = true ]; then
+    echo "WARNING: Docker Desktop cannot share '$DATA_PATH'; continuing because --force was given. Add it in Docker Desktop > Settings > Resources > File Sharing or servers will not start." >&2
+  else
+    fail "Docker Desktop cannot share '$DATA_PATH'. Add it in Docker Desktop > Settings > Resources > File Sharing."
+  fi
 fi
 DOCKER_DATA_ROOT=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/probe"}}{{.Source}}{{end}}{{end}}' "$PROBE_CONTAINER" 2>/dev/null || true)
-[ -n "$DOCKER_DATA_ROOT" ] || fail "Could not determine the Docker daemon path for '$DATA_PATH'."
+if [ -z "$DOCKER_DATA_ROOT" ]; then
+  if [ "$FORCE" = true ]; then
+    DOCKER_DATA_ROOT=$DATA_PATH
+    echo "WARNING: Could not determine the Docker daemon path for '$DATA_PATH'; writing the host path instead because --force was given. Fix Docker Desktop file sharing if containers cannot start." >&2
+  else
+    fail "Could not determine the Docker daemon path for '$DATA_PATH'."
+  fi
+fi
 docker rm -f "$PROBE_CONTAINER" >/dev/null 2>&1
 PROBE_CONTAINER=
 
@@ -115,7 +137,11 @@ PROBE_CONTAINER=
 if ! docker run --rm --group-add 0 \
   --mount "type=bind,source=$DOCKER_SOCKET_PATH,target=/var/run/docker.sock" \
   docker:cli docker info >/dev/null 2>&1; then
-  fail "Docker is not accessible through '$DOCKER_SOCKET_PATH'. Enable Docker Desktop's default Unix socket setting, then retry: https://docs.docker.com/desktop/setup/install/mac-install/"
+  if [ "$FORCE" = true ]; then
+    echo "WARNING: Docker is not accessible through '$DOCKER_SOCKET_PATH'; continuing because --force was given. Enable Docker Desktop's default Unix socket setting if the agent cannot start servers: https://docs.docker.com/desktop/setup/install/mac-install/" >&2
+  else
+    fail "Docker is not accessible through '$DOCKER_SOCKET_PATH'. Enable Docker Desktop's default Unix socket setting, then retry: https://docs.docker.com/desktop/setup/install/mac-install/"
+  fi
 fi
 VISIBLE_TOKEN=$(docker run --rm --group-add 0 \
   --mount "type=bind,source=$DOCKER_SOCKET_PATH,target=/var/run/docker.sock" \
@@ -123,7 +149,11 @@ VISIBLE_TOKEN=$(docker run --rm --group-add 0 \
   --mount "type=bind,src=$DOCKER_DATA_ROOT/$PROBE_NAME,dst=/probe,readonly" \
   --entrypoint cat alpine:3.21 /probe/token 2>/dev/null || true)
 if [ "$VISIBLE_TOKEN" != "$PROBE_TOKEN" ]; then
-  fail "Docker Desktop cannot see the same data directory at '$DOCKER_DATA_ROOT/$PROBE_NAME'. Check its file-sharing settings and retry."
+  if [ "$FORCE" = true ]; then
+    echo "WARNING: Docker Desktop cannot see the same data directory at '$DOCKER_DATA_ROOT/$PROBE_NAME'; continuing because --force was given. Check its file-sharing settings if container file access fails." >&2
+  else
+    fail "Docker Desktop cannot see the same data directory at '$DOCKER_DATA_ROOT/$PROBE_NAME'. Check its file-sharing settings and retry."
+  fi
 fi
 rm -rf "$PROBE_DIR"
 PROBE_DIR=
@@ -160,7 +190,11 @@ fi
 # shellcheck disable=SC2086
 docker compose $COMPOSE_ARGS config --quiet || fail "Docker Compose configuration is invalid. Review .env."
 if [ "$MODE" = local ] && ! docker network inspect "${CRAFTPILOT_MASTER_NETWORK:-craftpilot_default}" >/dev/null 2>&1; then
-  fail "Local CraftPilot network '${CRAFTPILOT_MASTER_NETWORK:-craftpilot_default}' was not found. Start the CraftPilot stack on this Mac first."
+  if [ "$FORCE" = true ]; then
+    echo "WARNING: Local CraftPilot network '${CRAFTPILOT_MASTER_NETWORK:-craftpilot_default}' was not found; continuing because --force was given. Start the CraftPilot stack before the agent can reach the master." >&2
+  else
+    fail "Local CraftPilot network '${CRAFTPILOT_MASTER_NETWORK:-craftpilot_default}' was not found. Start the CraftPilot stack on this Mac first."
+  fi
 fi
 echo "Building and starting CraftPilot Runtime Agent on macOS ($MODE mode, master $MASTER_URL)."
 echo "Server data: $DATA_PATH"

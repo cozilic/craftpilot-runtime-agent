@@ -1,6 +1,23 @@
+<#
+.SYNOPSIS
+Prepares and starts the CraftPilot Runtime Agent on Windows through WSL 2.
+
+.PARAMETER Local
+Connect to a CraftPilot stack running on this machine instead of the
+production master. Needs -CaFile.
+
+.PARAMETER CaFile
+Path to the local CraftPilot CA (CraftPilot/runtime-agent/local-certs/ca.crt).
+
+.PARAMETER Force
+Continue past environment preflight failures: missing Docker Compose/Buildx,
+a Docker socket or bind-mount probe that fails, and a missing local CraftPilot
+network. Safety checks (.env symlink, server-data path) are still enforced.
+#>
 param(
     [switch] $Local,
-    [string] $CaFile
+    [string] $CaFile,
+    [switch] $Force
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,7 +53,11 @@ if ($LASTEXITCODE -ne 0 -or ($WslDocker -join "`n") -notmatch '(?m)^linux\s*$') 
 }
 $ComposeCheck = @(& wsl.exe -d $PreferredDistro -- bash -lc 'docker compose version && docker buildx version' 2>&1)
 if ($LASTEXITCODE -ne 0) {
-    Fail "Docker Compose v2 and Buildx must be available inside '$PreferredDistro'. Update Docker Desktop and retry."
+    if ($Force) {
+        Write-Warning "Docker Compose v2 or Buildx is missing inside '$PreferredDistro'; continuing because -Force was given. Update Docker Desktop if the build fails."
+    } else {
+        Fail "Docker Compose v2 and Buildx must be available inside '$PreferredDistro'. Update Docker Desktop and retry."
+    }
 }
 
 # Local mode: verify the CA here, then reference it through its WSL path.
@@ -44,10 +65,10 @@ $WslCaFile = ''
 if ($Local) {
     $caPath = if ($CaFile) { $CaFile } else { $env:CRAFTPILOT_LOCAL_CA_FILE }
     if (-not $caPath) {
-        Fail 'Local mode needs the local CraftPilot CA: pass -CaFile C:\Projects\CraftPilot\runtime-agent\local-certs\ca.crt'
+        Fail 'Local mode needs the local CraftPilot CA: pass -CaFile C:\Projects\CraftPilot\runtime-agent\local-certs\ca.crt (generated in the CraftPilot checkout by runtime-agent/create-local-certs.sh)'
     }
     if (-not (Test-Path -LiteralPath $caPath -PathType Leaf)) {
-        Fail "Local CA not found: $caPath"
+        Fail "Local CA not found: $caPath. It is generated in the CraftPilot checkout by: bash runtime-agent/create-local-certs.sh"
     }
     $ResolvedCa = (Resolve-Path -LiteralPath $caPath).Path
     $WslCaFile = (@(& wsl.exe -d $PreferredDistro -- wslpath -a ($ResolvedCa -replace '\\', '/')) -join '').Trim()
@@ -93,11 +114,16 @@ if ($LASTEXITCODE -ne 0) {
 # Verify WSL's Docker socket and daemon-side bind mounts before changing .env.
 $ProbeOutput = @(& wsl.exe -d $PreferredDistro -- bash -lc "set -eu; test -S /var/run/docker.sock; mkdir -p '$WslDataPath'; docker run --rm --mount 'type=bind,source=$WslDataPath,target=/probe' alpine:3.21 sh -ec 'chown 0:33 /probe && chmod 2770 /probe'; docker run --rm --user 33:33 --mount 'type=bind,source=$WslDataPath,target=/probe' alpine:3.21 sh -ec 'touch /probe/.write-test && rm /probe/.write-test'" 2>&1)
 if ($LASTEXITCODE -ne 0) {
-    Fail "The Docker daemon or Linux data mount is unavailable from '$PreferredDistro'. Ensure Docker Desktop WSL integration is enabled. Details: $($ProbeOutput -join ' ')"
+    if ($Force) {
+        Write-Warning "The Docker daemon or Linux data mount probe failed inside '$PreferredDistro'; continuing because -Force was given. Ensure Docker Desktop WSL integration is enabled if servers cannot start. Details: $($ProbeOutput -join ' ')"
+    } else {
+        Fail "The Docker daemon or Linux data mount is unavailable from '$PreferredDistro'. Ensure Docker Desktop WSL integration is enabled. Details: $($ProbeOutput -join ' ')"
+    }
 }
 
 $SetupMode = if ($Local) { 'local' } else { 'deploy' }
-$ModePrelude = "export SETUP_MODE='$SetupMode'`nexport CRAFTPILOT_LOCAL_CA_FILE_OVERRIDE='$WslCaFile'`n"
+$ForceValue = if ($Force) { '1' } else { '0' }
+$ModePrelude = "export SETUP_MODE='$SetupMode'`nexport CRAFTPILOT_SETUP_FORCE='$ForceValue'`nexport CRAFTPILOT_LOCAL_CA_FILE_OVERRIDE='$WslCaFile'`n"
 
 $WslCommand = $ModePrelude + @'
 set -eu
@@ -142,8 +168,12 @@ PY
 if [ "$SETUP_MODE" = local ]; then
   docker compose -f docker-compose.yml -f docker-compose.local.yml config --quiet
   if ! docker network inspect "${CRAFTPILOT_MASTER_NETWORK:-craftpilot_default}" >/dev/null 2>&1; then
-    echo "Local CraftPilot network '${CRAFTPILOT_MASTER_NETWORK:-craftpilot_default}' was not found. Start the CraftPilot stack first." >&2
-    exit 1
+    if [ "${CRAFTPILOT_SETUP_FORCE:-0}" = 1 ]; then
+      echo "WARNING: Local CraftPilot network '${CRAFTPILOT_MASTER_NETWORK:-craftpilot_default}' was not found; continuing because -Force was given. Start the CraftPilot stack first." >&2
+    else
+      echo "Local CraftPilot network '${CRAFTPILOT_MASTER_NETWORK:-craftpilot_default}' was not found. Start the CraftPilot stack first." >&2
+      exit 1
+    fi
   fi
   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
   echo "Agent started against the local CraftPilot stack (approve its enrollment request in the panel):"

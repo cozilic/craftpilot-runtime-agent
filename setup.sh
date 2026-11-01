@@ -18,6 +18,10 @@ require_commands() {
 
 ask_to_install() {
   message=$1
+  if [ "${FORCE:-false}" = true ]; then
+    echo "$message Installing because --force was given."
+    return 0
+  fi
   if [ ! -t 0 ]; then
     echo "$message" >&2
     echo "Re-run setup interactively to approve, or install the dependency manually." >&2
@@ -28,6 +32,7 @@ ask_to_install() {
   case "$answer" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
+FORCE=false
 if ! command -v id >/dev/null 2>&1 || ! command -v uname >/dev/null 2>&1; then
   echo "The id and uname host utilities are required to identify the current user and Linux architecture; install them manually, then rerun setup.sh." >&2
   exit 1
@@ -50,6 +55,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --local) MODE=local ;;
     --deploy) MODE=deploy ;;
+    --force) FORCE=true ;;
     --ca-file)
       [ "$#" -ge 2 ] || { echo "--ca-file requires a path." >&2; exit 1; }
       LOCAL_CA_FILE=$2
@@ -58,7 +64,7 @@ while [ "$#" -gt 0 ]; do
     --ca-file=*) LOCAL_CA_FILE=${1#--ca-file=} ;;
     -h|--help)
       cat <<'USAGE'
-Usage: sh setup.sh [--local | --deploy] [--ca-file <path>]
+Usage: sh setup.sh [--local | --deploy] [--ca-file <path>] [--force]
 
   (no flag), --deploy   Connect to the production master (default).
   --local               Connect to a CraftPilot stack on this machine. Sets
@@ -66,6 +72,14 @@ Usage: sh setup.sh [--local | --deploy] [--ca-file <path>]
                         --ca-file pointing at that checkout's
                         runtime-agent/local-certs/ca.crt.
   --ca-file <path>      CA used to verify the local CraftPilot master.
+  --force               Continue past environment preflight failures: low
+                        available memory/disk, missing /etc/os-release, Docker
+                        Engine or Buildx below the required version, and a
+                        missing local CraftPilot network. It also approves
+                        package installations without a prompt. Safety checks
+                        are still enforced: .env must not be a symlink and the
+                        server-data path may not be a system directory, contain
+                        '..', or traverse a symlink.
 
 Environment overrides: CRAFTPILOT_DEPLOY_MASTER_URL,
 CRAFTPILOT_LOCAL_MASTER_URL (default https://runtime-tls),
@@ -78,6 +92,16 @@ USAGE
   shift
 done
 
+# Report an environment problem: fatal by default, a loud warning with --force.
+stop_or_force() {
+  echo "$1" >&2
+  if [ "$FORCE" = true ]; then
+    echo "Continuing anyway because --force was given; the agent may not behave as expected." >&2
+    return 0
+  fi
+  exit 1
+}
+
 if [ -n "${CRAFTPILOT_LOCAL_CA_FILE:-}" ] && [ -z "$LOCAL_CA_FILE" ]; then
   LOCAL_CA_FILE=$CRAFTPILOT_LOCAL_CA_FILE
 fi
@@ -86,10 +110,12 @@ if [ "$MODE" = local ]; then
   MASTER_URL=${CRAFTPILOT_LOCAL_MASTER_URL:-https://runtime-tls}
   if [ -z "$LOCAL_CA_FILE" ]; then
     echo "--local needs the local CraftPilot CA: pass --ca-file <CraftPilot/runtime-agent/local-certs/ca.crt> or set CRAFTPILOT_LOCAL_CA_FILE." >&2
+    echo "That file is generated in the CraftPilot checkout (not this repository) by: bash runtime-agent/create-local-certs.sh" >&2
     exit 1
   fi
   if [ -L "$LOCAL_CA_FILE" ] || [ ! -f "$LOCAL_CA_FILE" ] || [ ! -r "$LOCAL_CA_FILE" ]; then
     echo "The local CA must be a readable regular file (not a symlink): $LOCAL_CA_FILE" >&2
+    echo "Create it in the CraftPilot checkout with: bash runtime-agent/create-local-certs.sh" >&2
     exit 1
   fi
 fi
@@ -97,10 +123,12 @@ fi
 . "$SCRIPT_DIR/host_resource_checks.sh"
 
 if [ ! -r /etc/os-release ]; then
-  echo "This setup script supports Linux distributions that provide /etc/os-release." >&2
-  exit 1
+  stop_or_force "This setup script supports Linux distributions that provide /etc/os-release."
+  ID=unknown
+  NAME=unknown
+else
+  . /etc/os-release
 fi
-. /etc/os-release
 
 DOCKER_ENGINE_MIN_VERSION=19.03.0
 BUILDX_MIN_VERSION=0.17.0
@@ -300,6 +328,8 @@ install_docker_stack() {
   if [ -t 0 ]; then
     printf "Docker Engine or Compose is missing. Install Docker's official Engine and Compose packages for this host? [y/N] "
     IFS= read -r answer || answer=
+  elif [ "$FORCE" = true ]; then
+    answer=y
   else
     answer=
   fi
@@ -518,8 +548,7 @@ docker_server_version=$(docker version --format '{{.Server.Version}}' 2>/dev/nul
 docker_server_version=${docker_server_version%%-*}
 docker_server_version=${docker_server_version%%+*}
 if [ -z "$docker_server_version" ] || ! version_at_least "$docker_server_version" "$DOCKER_ENGINE_MIN_VERSION"; then
-  echo "Docker Engine $DOCKER_ENGINE_MIN_VERSION or newer is required for Buildx builds; detected '${docker_server_version:-unavailable}'. Upgrade Docker Engine and rerun setup.sh." >&2
-  exit 1
+  stop_or_force "Docker Engine $DOCKER_ENGINE_MIN_VERSION or newer is required for Buildx builds; detected '${docker_server_version:-unavailable}'. Upgrade Docker Engine and rerun setup.sh."
 fi
 buildx_version=$(buildx_current_version || true)
 if [ -z "$buildx_version" ] || ! version_at_least "$buildx_version" "$BUILDX_MIN_VERSION"; then
@@ -527,8 +556,7 @@ if [ -z "$buildx_version" ] || ! version_at_least "$buildx_version" "$BUILDX_MIN
 fi
 buildx_version=$(buildx_current_version || true)
 if [ -z "$buildx_version" ] || ! version_at_least "$buildx_version" "$BUILDX_MIN_VERSION"; then
-  echo "Docker Buildx $BUILDX_MIN_VERSION or newer is required; detected '${buildx_version:-missing}'." >&2
-  exit 1
+  stop_or_force "Docker Buildx $BUILDX_MIN_VERSION or newer is required; detected '${buildx_version:-missing}'."
 fi
 if ! docker compose version >/dev/null 2>&1; then
   install_compose_plugin
@@ -672,15 +700,13 @@ if ! chmod 2770 "$SERVER_DATA_PATH" 2>/dev/null; then
 fi
 
 if ! check_host_resources /proc/meminfo "$SERVER_DATA_PATH" 4096 1024 10240 1024 "$docker_memory_bytes"; then
-  echo "Host resource preflight failed. Free memory or disk space before setting up a Minecraft runtime node." >&2
-  exit 1
+  stop_or_force "Host resource preflight failed. Free memory or disk space before setting up a Minecraft runtime node."
 fi
 
 if [ "$MODE" = local ]; then
   $COMPOSE -f docker-compose.yml -f docker-compose.local.yml config --quiet
   if ! docker network inspect "${CRAFTPILOT_MASTER_NETWORK:-craftpilot_default}" >/dev/null 2>&1; then
-    echo "Local CraftPilot network '${CRAFTPILOT_MASTER_NETWORK:-craftpilot_default}' was not found. Start the CraftPilot stack on this machine first (docker compose up -d), or set CRAFTPILOT_MASTER_NETWORK to its network name." >&2
-    exit 1
+    stop_or_force "Local CraftPilot network '${CRAFTPILOT_MASTER_NETWORK:-craftpilot_default}' was not found. Start the CraftPilot stack on this machine first (docker compose up -d), or set CRAFTPILOT_MASTER_NETWORK to its network name."
   fi
 else
   $COMPOSE config --quiet
