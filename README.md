@@ -90,6 +90,72 @@ docker compose logs -f runtime-agent
 
 Do not run the Linux `setup.sh` from PowerShell or execute the Compose project from a Windows-mounted `/mnt/c` checkout; Linux socket and sibling-container data mounts require the WSL filesystem and Docker integration.
 
+## Test against a local CraftPilot (`--local`)
+
+Instead of pointing at the production master, one checkout can talk to a CraftPilot stack running on the same machine. Every setup script takes a mode: `--deploy` (the default, `CRAFTPILOT_MASTER_URL=https://craftpilot.se`) or `--local`, which rewrites `CRAFTPILOT_MASTER_URL` and the local CA in `.env`. Rerunning the script switches modes, so no separate `.env` files or hand edits are needed.
+
+`docker compose up --local` is not a Compose feature. The mode lives in `.env` plus `docker-compose.local.yml`, which is why the start command below adds that file.
+
+### Prerequisites
+
+- The local CraftPilot stack is running (`docker compose up -d` in the CraftPilot checkout). Its Compose network is normally `craftpilot_default`; set `CRAFTPILOT_MASTER_NETWORK` if the checkout directory differs.
+- The local TLS bridge has a CA. Create it once in the CraftPilot checkout if `runtime-agent/local-certs/` is missing:
+
+  ```sh
+  bash runtime-agent/create-local-certs.sh
+  ```
+
+  Use that checkout's `runtime-agent/local-certs/ca.crt` as `--ca-file` below.
+
+### Start
+
+```sh
+sh setup.sh --local --ca-file ../CraftPilot/runtime-agent/local-certs/ca.crt
+docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+docker compose logs -f runtime-agent
+```
+
+```sh
+# macOS
+sh setup-macos.sh --local --ca-file ~/Projects/CraftPilot/runtime-agent/local-certs/ca.crt
+```
+
+```powershell
+# Windows/WSL 2
+.\setup-windows.ps1 -Local -CaFile C:\Projects\CraftPilot\runtime-agent\local-certs\ca.crt
+```
+
+Back to a real host: `sh setup.sh` (or `--deploy`) and plain `docker compose up -d --build`.
+
+### Addresses
+
+The container reaches the local stack as `https://runtime-tls`, the stack's internal TLS bridge. `localhost` cannot work there: inside a container it is the agent itself, and that bridge is published on the host's loopback only. `--local` therefore joins the external CraftPilot network and mounts the CA as `SSL_CERT_FILE`.
+
+An agent started directly on the host (Python, no container) can instead use:
+
+```sh
+CRAFTPILOT_MASTER_URL=https://localhost:8443 \
+SSL_CERT_FILE=<CraftPilot>/runtime-agent/local-certs/ca.crt \
+python3 craftpilot_runtime_agent.py
+```
+
+That works because the same CA certificate carries `localhost` and `127.0.0.1` SANs, and the bridge is published on `127.0.0.1:8443`.
+
+### Enroll, and recover a revoked local agent
+
+The agent self-enrolls; approve the request in CraftPilot under **Ops & log → Runtime nodes**. To attach an existing node instead, set `CRAFTPILOT_NODE_ID` (and `CRAFTPILOT_REGISTRATION_TOKEN` after a sysadmin re-enables the node) before starting.
+
+A local agent that keeps restarting with `credential was rejected or revoked` has a stale credential in its state volume. Reset the disposable local state so it enrolls again:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.local.yml down
+docker volume rm craftpilot-runtime-agent_agent_state
+```
+
+Only do this for local testing: the volume also holds the node credential and per-server RCON passwords.
+
+Local mode is not a production path. The local CA is development material, and the agent still gets full Docker control on the host.
+
 ## Enroll the node
 
 Enrollment is initiated by the agent; you do not need to create a node or copy a node ID and token manually during normal setup.
@@ -120,6 +186,8 @@ The checked-in `.env.example` provides safe defaults, including `CRAFTPILOT_MAST
 | `CRAFTPILOT_POLL_SECONDS` | `30` | Polling interval; allowed range is 5–120 seconds. |
 | `CRAFTPILOT_STOP_GRACE_SECONDS` | `30` | Graceful stop timeout; allowed range is 0–45 seconds. |
 | `CRAFTPILOT_LOG_LEVEL` | `INFO` | Python log level: `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
+| `CRAFTPILOT_LOCAL_CA_FILE` | Empty | Local mode only: CA that verifies the local CraftPilot TLS bridge; written by `--local --ca-file`. |
+| `CRAFTPILOT_MASTER_NETWORK` | `craftpilot_default` | Local mode only: external Compose network of the local CraftPilot stack. |
 
 Setup updates only platform-dependent settings; other `.env` values are preserved. Keep `.env` private and do not commit it.
 

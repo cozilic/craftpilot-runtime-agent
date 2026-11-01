@@ -1,0 +1,28 @@
+# Local development overlay: connect this agent to a CraftPilot stack running
+# on the same machine. Prepared by `sh setup.sh --local --ca-file <path>`.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+#
+# The agent joins the local CraftPilot Compose network and reaches the master
+# through the same internal TLS bridge the panel uses, so the address is
+# https://runtime-tls rather than localhost: inside a container, localhost is
+# the agent itself. An agent started directly on the host (python) can instead
+# use CRAFTPILOT_MASTER_URL=https://localhost:8443 with the same CA, because
+# that bridge is published on 127.0.0.1:8443.
+services:
+  runtime-agent:
+    environment:
+      CRAFTPILOT_MASTER_URL: ${CRAFTPILOT_MASTER_URL:-https://runtime-tls}
+      SSL_CERT_FILE: /run/craftpilot-local-ca/ca.crt
+    volumes:
+      - "${CRAFTPILOT_LOCAL_CA_FILE:?CRAFTPILOT_LOCAL_CA_FILE must point at CraftPilot's runtime-agent/local-certs/ca.crt}:/run/craftpilot-local-ca/ca.crt:ro"
+    networks:
+      - default
+      - craftpilot_local
+
+networks:
+  # The Compose project network of the local CraftPilot checkout, normally
+  # <checkout-directory>_default (craftpilot_default here).
+  craftpilot_local:
+    external: true
+    name: ${CRAFTPILOT_MASTER_NETWORK:-craftpilot_default}

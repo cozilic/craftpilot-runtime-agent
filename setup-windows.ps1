@@ -1,3 +1,8 @@
+param(
+    [switch] $Local,
+    [string] $CaFile
+)
+
 $ErrorActionPreference = 'Stop'
 
 function Fail([string] $Message) {
@@ -32,6 +37,23 @@ if ($LASTEXITCODE -ne 0 -or ($WslDocker -join "`n") -notmatch '(?m)^linux\s*$') 
 $ComposeCheck = @(& wsl.exe -d $PreferredDistro -- bash -lc 'docker compose version && docker buildx version' 2>&1)
 if ($LASTEXITCODE -ne 0) {
     Fail "Docker Compose v2 and Buildx must be available inside '$PreferredDistro'. Update Docker Desktop and retry."
+}
+
+# Local mode: verify the CA here, then reference it through its WSL path.
+$WslCaFile = ''
+if ($Local) {
+    $caPath = if ($CaFile) { $CaFile } else { $env:CRAFTPILOT_LOCAL_CA_FILE }
+    if (-not $caPath) {
+        Fail 'Local mode needs the local CraftPilot CA: pass -CaFile C:\Projects\CraftPilot\runtime-agent\local-certs\ca.crt'
+    }
+    if (-not (Test-Path -LiteralPath $caPath -PathType Leaf)) {
+        Fail "Local CA not found: $caPath"
+    }
+    $ResolvedCa = (Resolve-Path -LiteralPath $caPath).Path
+    $WslCaFile = (@(& wsl.exe -d $PreferredDistro -- wslpath -a ($ResolvedCa -replace '\\', '/')) -join '').Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $WslCaFile.StartsWith('/')) {
+        Fail 'Could not translate the local CA path into the WSL distribution.'
+    }
 }
 
 # Store the repository and server data in the WSL Linux filesystem, not /mnt/c.
@@ -74,17 +96,27 @@ if ($LASTEXITCODE -ne 0) {
     Fail "The Docker daemon or Linux data mount is unavailable from '$PreferredDistro'. Ensure Docker Desktop WSL integration is enabled. Details: $($ProbeOutput -join ' ')"
 }
 
-$WslCommand = @'
+$SetupMode = if ($Local) { 'local' } else { 'deploy' }
+$ModePrelude = "export SETUP_MODE='$SetupMode'`nexport CRAFTPILOT_LOCAL_CA_FILE_OVERRIDE='$WslCaFile'`n"
+
+$WslCommand = $ModePrelude + @'
 set -eu
 cd "$HOME/craftpilot-runtime-agent"
 [ ! -L .env ] || { echo ".env must not be a symlink." >&2; exit 1; }
 [ -f .env ] || { umask 077; cp .env.example .env; }
+if [ "$SETUP_MODE" = local ]; then
+  [ -n "$CRAFTPILOT_LOCAL_CA_FILE_OVERRIDE" ] || { echo "Local mode needs a CA file." >&2; exit 1; }
+  [ -r "$CRAFTPILOT_LOCAL_CA_FILE_OVERRIDE" ] || { echo "Local CA is not readable from WSL: $CRAFTPILOT_LOCAL_CA_FILE_OVERRIDE" >&2; exit 1; }
+  MASTER_URL=${CRAFTPILOT_LOCAL_MASTER_URL:-https://runtime-tls}
+else
+  MASTER_URL=${CRAFTPILOT_DEPLOY_MASTER_URL:-https://craftpilot.se}
+fi
 export CRAFTPILOT_SERVER_DATA_HOST_PATH="$HOME/craftpilot-runtime-agent/server-data"
 export CRAFTPILOT_DOCKER_SERVER_DATA_ROOT="$CRAFTPILOT_SERVER_DATA_HOST_PATH"
 export DOCKER_GID="$(stat -c %g /var/run/docker.sock)"
 mkdir -p "$CRAFTPILOT_SERVER_DATA_HOST_PATH"
 chmod 600 .env
-python3 - "$CRAFTPILOT_SERVER_DATA_HOST_PATH" "$CRAFTPILOT_DOCKER_SERVER_DATA_ROOT" "$DOCKER_GID" <<'PY'
+python3 - "$CRAFTPILOT_SERVER_DATA_HOST_PATH" "$CRAFTPILOT_DOCKER_SERVER_DATA_ROOT" "$DOCKER_GID" "$MASTER_URL" "$CRAFTPILOT_LOCAL_CA_FILE_OVERRIDE" <<'PY'
 from pathlib import Path
 import re
 import sys
@@ -94,6 +126,8 @@ updates = {
     'CRAFTPILOT_SERVER_DATA_HOST_PATH': sys.argv[1],
     'CRAFTPILOT_DOCKER_SERVER_DATA_ROOT': sys.argv[2],
     'DOCKER_GID': sys.argv[3],
+    'CRAFTPILOT_MASTER_URL': sys.argv[4],
+    'CRAFTPILOT_LOCAL_CA_FILE': sys.argv[5],
 }
 for key, value in updates.items():
     line = re.compile(rf'^{re.escape(key)}=.*$', re.MULTILINE)
@@ -105,9 +139,19 @@ for key, value in updates.items():
 path.write_text(content, encoding='utf-8')
 path.chmod(0o600)
 PY
-docker compose config --quiet
-docker compose up -d --build
-echo "Agent started. Follow logs and approve enrollment in CraftPilot:"
+if [ "$SETUP_MODE" = local ]; then
+  docker compose -f docker-compose.yml -f docker-compose.local.yml config --quiet
+  if ! docker network inspect "${CRAFTPILOT_MASTER_NETWORK:-craftpilot_default}" >/dev/null 2>&1; then
+    echo "Local CraftPilot network '${CRAFTPILOT_MASTER_NETWORK:-craftpilot_default}' was not found. Start the CraftPilot stack first." >&2
+    exit 1
+  fi
+  docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+  echo "Agent started against the local CraftPilot stack (approve its enrollment request in the panel):"
+else
+  docker compose config --quiet
+  docker compose up -d --build
+  echo "Agent started. Follow logs and approve enrollment in CraftPilot:"
+fi
 echo "  docker compose logs -f runtime-agent"
 '@
 $Encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($WslCommand))

@@ -11,6 +11,58 @@ fail() {
 [ "$(uname -s)" = Darwin ] || fail "Run this script from macOS. Use setup.sh on Linux or setup-windows.ps1 on Windows."
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 cd "$SCRIPT_DIR"
+
+MODE=deploy
+LOCAL_CA_FILE=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --local) MODE=local ;;
+    --deploy) MODE=deploy ;;
+    --ca-file)
+      [ "$#" -ge 2 ] || fail "--ca-file requires a path."
+      LOCAL_CA_FILE=$2
+      shift
+      ;;
+    --ca-file=*) LOCAL_CA_FILE=${1#--ca-file=} ;;
+    -h|--help)
+      printf '%s\n' \
+        "Usage: sh setup-macos.sh [--local | --deploy] [--ca-file <path>]" \
+        "" \
+        "  (no flag), --deploy   Connect to the production master (default)." \
+        "  --local               Connect to a CraftPilot stack on this Mac;" \
+        "                        needs --ca-file <CraftPilot/runtime-agent/local-certs/ca.crt>." \
+        "  --ca-file <path>      CA used to verify the local CraftPilot master."
+      exit 0
+      ;;
+    *) fail "Unknown option: $1 (run with --help)" ;;
+  esac
+  shift
+done
+
+if [ -n "${CRAFTPILOT_LOCAL_CA_FILE:-}" ] && [ -z "$LOCAL_CA_FILE" ]; then
+  LOCAL_CA_FILE=$CRAFTPILOT_LOCAL_CA_FILE
+fi
+MASTER_URL=${CRAFTPILOT_DEPLOY_MASTER_URL:-https://craftpilot.se}
+if [ "$MODE" = local ]; then
+  MASTER_URL=${CRAFTPILOT_LOCAL_MASTER_URL:-https://runtime-tls}
+  [ -n "$LOCAL_CA_FILE" ] || fail "--local needs the local CraftPilot CA: pass --ca-file <CraftPilot/runtime-agent/local-certs/ca.crt>."
+  [ -f "$LOCAL_CA_FILE" ] && [ -r "$LOCAL_CA_FILE" ] && [ ! -L "$LOCAL_CA_FILE" ] || fail "The local CA must be a readable regular file (not a symlink): $LOCAL_CA_FILE"
+fi
+
+set_env_value() {
+  env_key=$1
+  env_value=$2
+  env_tmp=$(mktemp .env.tmp.XXXXXX)
+  awk -v key="$env_key" -v value="$env_value" '
+    $0 ~ "^" key "=" && !seen { print key "=" value; seen = 1; next }
+    { print }
+    END { if (!seen) print key "=" value }
+  ' .env > "$env_tmp"
+  chmod 600 "$env_tmp"
+  mv -f "$env_tmp" .env
+  chmod 600 .env
+}
+
 command -v docker >/dev/null 2>&1 || fail "Docker CLI not found. Install Docker Desktop for Mac: https://docs.docker.com/desktop/setup/install/mac-install/"
 docker info >/dev/null 2>&1 || fail "Docker Desktop is not running. Start it and enable Linux containers."
 docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is required; update Docker Desktop."
@@ -96,10 +148,24 @@ mv -f "$ENV_TMP" .env
 ENV_TMP=
 chmod 600 .env
 
-docker compose config --quiet || fail "Docker Compose configuration is invalid. Review .env."
-echo "Building and starting CraftPilot Runtime Agent on macOS."
+set_env_value CRAFTPILOT_MASTER_URL "$MASTER_URL"
+if [ "$MODE" = local ]; then
+  set_env_value CRAFTPILOT_LOCAL_CA_FILE "$LOCAL_CA_FILE"
+  COMPOSE_ARGS="-f docker-compose.yml -f docker-compose.local.yml"
+else
+  set_env_value CRAFTPILOT_LOCAL_CA_FILE ""
+  COMPOSE_ARGS=
+fi
+
+# shellcheck disable=SC2086
+docker compose $COMPOSE_ARGS config --quiet || fail "Docker Compose configuration is invalid. Review .env."
+if [ "$MODE" = local ] && ! docker network inspect "${CRAFTPILOT_MASTER_NETWORK:-craftpilot_default}" >/dev/null 2>&1; then
+  fail "Local CraftPilot network '${CRAFTPILOT_MASTER_NETWORK:-craftpilot_default}' was not found. Start the CraftPilot stack on this Mac first."
+fi
+echo "Building and starting CraftPilot Runtime Agent on macOS ($MODE mode, master $MASTER_URL)."
 echo "Server data: $DATA_PATH"
 echo "Docker daemon server-data path: $DOCKER_DATA_ROOT"
-docker compose up -d --build
+# shellcheck disable=SC2086
+docker compose $COMPOSE_ARGS up -d --build
 echo "Agent started. Follow logs and approve enrollment in CraftPilot:"
 echo "  docker compose logs -f runtime-agent"

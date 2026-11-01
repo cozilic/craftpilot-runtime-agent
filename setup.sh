@@ -43,6 +43,57 @@ case "$0" in
 esac
 SCRIPT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR" && pwd)
 cd "$SCRIPT_DIR"
+
+MODE=deploy
+LOCAL_CA_FILE=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --local) MODE=local ;;
+    --deploy) MODE=deploy ;;
+    --ca-file)
+      [ "$#" -ge 2 ] || { echo "--ca-file requires a path." >&2; exit 1; }
+      LOCAL_CA_FILE=$2
+      shift
+      ;;
+    --ca-file=*) LOCAL_CA_FILE=${1#--ca-file=} ;;
+    -h|--help)
+      cat <<'USAGE'
+Usage: sh setup.sh [--local | --deploy] [--ca-file <path>]
+
+  (no flag), --deploy   Connect to the production master (default).
+  --local               Connect to a CraftPilot stack on this machine. Sets
+                        CRAFTPILOT_MASTER_URL=https://runtime-tls and needs
+                        --ca-file pointing at that checkout's
+                        runtime-agent/local-certs/ca.crt.
+  --ca-file <path>      CA used to verify the local CraftPilot master.
+
+Environment overrides: CRAFTPILOT_DEPLOY_MASTER_URL,
+CRAFTPILOT_LOCAL_MASTER_URL (default https://runtime-tls),
+CRAFTPILOT_MASTER_NETWORK (default craftpilot_default).
+USAGE
+      exit 0
+      ;;
+    *) echo "Unknown option: $1 (run with --help)" >&2; exit 1 ;;
+  esac
+  shift
+done
+
+if [ -n "${CRAFTPILOT_LOCAL_CA_FILE:-}" ] && [ -z "$LOCAL_CA_FILE" ]; then
+  LOCAL_CA_FILE=$CRAFTPILOT_LOCAL_CA_FILE
+fi
+MASTER_URL=${CRAFTPILOT_DEPLOY_MASTER_URL:-https://craftpilot.se}
+if [ "$MODE" = local ]; then
+  MASTER_URL=${CRAFTPILOT_LOCAL_MASTER_URL:-https://runtime-tls}
+  if [ -z "$LOCAL_CA_FILE" ]; then
+    echo "--local needs the local CraftPilot CA: pass --ca-file <CraftPilot/runtime-agent/local-certs/ca.crt> or set CRAFTPILOT_LOCAL_CA_FILE." >&2
+    exit 1
+  fi
+  if [ -L "$LOCAL_CA_FILE" ] || [ ! -f "$LOCAL_CA_FILE" ] || [ ! -r "$LOCAL_CA_FILE" ]; then
+    echo "The local CA must be a readable regular file (not a symlink): $LOCAL_CA_FILE" >&2
+    exit 1
+  fi
+fi
+
 . "$SCRIPT_DIR/host_resource_checks.sh"
 
 if [ ! -r /etc/os-release ]; then
@@ -526,6 +577,28 @@ chmod 600 "$ENV_TMP"
 mv -f -- "$ENV_TMP" .env
 chmod 600 .env
 
+# Set one key=value line in .env without touching the others.
+set_env_value() {
+  env_key=$1
+  env_value=$2
+  env_tmp=$(mktemp .env.tmp.XXXXXX)
+  awk -v key="$env_key" -v value="$env_value" '
+    $0 ~ "^" key "=" && !seen { print key "=" value; seen = 1; next }
+    { print }
+    END { if (!seen) print key "=" value }
+  ' .env > "$env_tmp"
+  chmod 600 "$env_tmp"
+  mv -f -- "$env_tmp" .env
+  chmod 600 .env
+}
+
+set_env_value CRAFTPILOT_MASTER_URL "$MASTER_URL"
+if [ "$MODE" = local ]; then
+  set_env_value CRAFTPILOT_LOCAL_CA_FILE "$LOCAL_CA_FILE"
+else
+  set_env_value CRAFTPILOT_LOCAL_CA_FILE ""
+fi
+
 SERVER_DATA_PATH=$(sed -n 's/^CRAFTPILOT_SERVER_DATA_HOST_PATH=//p' .env | tail -n 1)
 SERVER_DATA_PATH=${SERVER_DATA_PATH:-/srv/craftpilot/servers}
 case "$SERVER_DATA_PATH" in
@@ -603,9 +676,23 @@ if ! check_host_resources /proc/meminfo "$SERVER_DATA_PATH" 4096 1024 10240 1024
   exit 1
 fi
 
-$COMPOSE config --quiet
+if [ "$MODE" = local ]; then
+  $COMPOSE -f docker-compose.yml -f docker-compose.local.yml config --quiet
+  if ! docker network inspect "${CRAFTPILOT_MASTER_NETWORK:-craftpilot_default}" >/dev/null 2>&1; then
+    echo "Local CraftPilot network '${CRAFTPILOT_MASTER_NETWORK:-craftpilot_default}' was not found. Start the CraftPilot stack on this machine first (docker compose up -d), or set CRAFTPILOT_MASTER_NETWORK to its network name." >&2
+    exit 1
+  fi
+else
+  $COMPOSE config --quiet
+fi
 echo "Setup complete. Configuration is in .env (mode 600)."
+echo "Mode: $MODE (master: $MASTER_URL)."
 echo "Server data: $SERVER_DATA_PATH (group $DATA_GID, setgid)."
-echo "Start the agent with: $COMPOSE up -d --build"
+if [ "$MODE" = local ]; then
+  echo "Start the agent with: $COMPOSE -f docker-compose.yml -f docker-compose.local.yml up -d --build"
+  echo "The agent joins the local CraftPilot network (${CRAFTPILOT_MASTER_NETWORK:-craftpilot_default}); approve its enrollment request in the panel."
+else
+  echo "Start the agent with: $COMPOSE up -d --build"
+fi
 echo "Verified Docker Engine, Compose $(docker compose version --short 2>/dev/null || docker compose version), and Buildx $buildx_version (minimum $BUILDX_MIN_VERSION)."
 echo "Review the pending enrollment in CraftPilot before it receives node credentials."
