@@ -191,6 +191,10 @@ If the state volume is lost, ask a sysadmin to disable and re-enroll the node; d
 
 If an admin deletes the node at the master, the agent’s next authenticated request is rejected. Instead of idling, the agent files a **replacement enrollment request** (same hostname, new request ID) so the node shows up again in the panel’s pending **Agent requests** list (`Agentförfrågningar`). Approve it to give the host a new node identity; the deleted node’s servers can be adopted from that node during approval. If the request is denied, the agent stays idle and waits for a fresh `CRAFTPILOT_REGISTRATION_TOKEN` rather than filing new requests. A registration token that is still present from an earlier setup is discarded once the master rejects it.
 
+A pending enrollment request also expires at the master (24 h). Polling an expired or removed request returns `401`, which the agent now treats as "this request is gone": it logs `runtime_agent_enrollment_unknown`, drops the saved request and files a fresh one, so the host reappears in **Agent requests** instead of retrying a dead request ID forever (the old behaviour was an endless `master_request_failed status=401 retrying`).
+
+After a replacement enrollment is approved, the state volume holds a new node ID while `.env` may still pin the old, deleted one in `CRAFTPILOT_NODE_ID`. The agent logs `runtime_agent_node_id_overridden` and follows the master-approved ID, so it does not refuse to start with "saved node credentials do not match the configured node". Remove the stale pin from `.env` when convenient.
+
 ## Configuration
 
 The checked-in `.env.example` provides safe defaults, including `CRAFTPILOT_MASTER_URL=https://craftpilot.se`. Linux setup fills in the host-specific `DOCKER_GID`; the macOS and Windows launchers configure the Docker Desktop/WSL socket group. No registration token is needed for initial self-enrollment.

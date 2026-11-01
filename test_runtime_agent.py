@@ -147,6 +147,32 @@ class EnrollmentTests(unittest.TestCase):
             self.agent.poll_enrollment_once()
         self.assertIsNone(self.agent.state)
 
+    def test_unknown_enrollment_request_files_a_fresh_one(self):
+        # 401 från poll = mastern känner inte igen ärendet (utgånget/reansat).
+        # Agenten får inte retra för evigt på en död id — den ska be om ett
+        # nytt godkännande i panelen i stället.
+        stale = "9f4a2d91-728a-4e9e-a4a2-a580f263da66"
+        fresh = "2b5c3d41-1111-4222-8333-944455556666"
+        self.agent.store.save({"node_id": None, "enrollment_request_id": stale,
+                               "enrollment_request_secret": "s" * 64})
+        self.agent.pending_enrollment = {"request_id": stale, "request_secret": "s" * 64}
+        calls = []
+
+        def request(method, path, body, credential=False):
+            calls.append(path)
+            if path.endswith("/poll"):
+                raise agent_module.HttpStatusError(401)
+            if path == "/api/runtime/enrollments":
+                return {"request_id": fresh, "request_secret": "t" * 64}
+            raise AssertionError(path)
+
+        self.agent._request = request
+        self.assertFalse(self.agent.poll_enrollment_once())
+        self.assertEqual([f"/api/runtime/enrollments/{stale}/poll", "/api/runtime/enrollments"], calls)
+        self.assertFalse(self.agent.credential_revoked)
+        self.assertEqual(fresh, self.agent.pending_enrollment["request_id"])
+        self.assertEqual(fresh, self.agent.store.load()["enrollment_request_id"])
+
     def _revoked_agent(self, node_id, registration_token=None):
         config = Config(
             master_url=self.config.master_url,
@@ -230,6 +256,28 @@ class EnrollmentTests(unittest.TestCase):
         self.assertEqual([("POST", f"/api/runtime/nodes/{node_id}/register", {"registration_token": token})], calls)
         self.assertIsNone(self.agent.config.registration_token)
         self.assertNotIn("credential_revoked", self.agent.store.load())
+
+    def test_approved_replacement_node_id_wins_over_a_stale_configured_id(self):
+        # Ersättningsenrollment ger ett NYTT node-id medan miljön pinnar det
+        # gamla, raderade id:t. Utan undantaget vägrar agenten starta efter
+        # godkännandet ("saved node credentials do not match").
+        old = "9f4a2d91-728a-4e9e-a4a2-a580f263da67"
+        new = "2b5c3d41-1111-4222-8333-944455556666"
+        agent = self._revoked_agent(old)
+        agent.store.save({"node_id": new, "credential": "c" * 64, "sequence": 3,
+                          "enrolled_via_master": True})
+
+        self.assertTrue(agent.ensure_registered())
+        self.assertEqual(new, agent.config.node_id)
+
+    def test_mismatched_saved_node_without_approval_marker_still_fails(self):
+        old = "9f4a2d91-728a-4e9e-a4a2-a580f263da67"
+        other = "2b5c3d41-1111-4222-8333-944455556666"
+        agent = self._revoked_agent(old)
+        agent.store.save({"node_id": other, "credential": "c" * 64, "sequence": 3})
+
+        with self.assertRaisesRegex(AgentError, "do not match"):
+            agent.ensure_registered()
 
     def test_marking_a_credential_revoked_discards_it_and_keeps_the_node_id(self):
         node_id = "9f4a2d91-728a-4e9e-a4a2-a580f263da67"

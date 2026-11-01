@@ -1388,10 +1388,20 @@ class RuntimeNodeAgent:
         if state is not None:
             credential, node_id, sequence = state.get("credential"), state.get("node_id"), state.get("sequence")
             if ((node_id is not None and (not isinstance(node_id, str) or not UUID_RE.fullmatch(node_id)))
-                    or (self.config.node_id is not None and node_id is not None and node_id != self.config.node_id)
                     or not isinstance(credential, str) or not re.fullmatch(r"[A-Za-z0-9]{64}", credential)
                     or isinstance(sequence, bool) or not isinstance(sequence, int) or not 0 <= sequence <= 2147483647):
                 raise AgentError("saved node credentials do not match the configured node")
+            if self.config.node_id is not None and node_id is not None and node_id != self.config.node_id:
+                # Ett godkänt ärende kan ha gett ett NYTT node-id (ersättning
+                # efter att noden raderats) medan miljön fortfarande pinnar det
+                # gamla. Masern har redan godkänt det sparade id:t — följ det i
+                # stället för att vägra starta för alltid efter godkännandet.
+                if state.get("enrolled_via_master") is True:
+                    LOGGER.warning("runtime_agent_node_id_overridden saved=%s configured=%s",
+                                   node_id, self.config.node_id)
+                    self._set_node_id(node_id)
+                else:
+                    raise AgentError("saved node credentials do not match the configured node")
             self.state = state
             if isinstance(self.runtime, DockerRuntime):
                 self.runtime.state = self.state
@@ -1536,7 +1546,19 @@ class RuntimeNodeAgent:
                 self.pending_enrollment = pending
             else:
                 return self.ensure_registered()
-        result = self._request("POST", f"/api/runtime/enrollments/{pending['request_id']}/poll", {"request_secret": pending["request_secret"]})
+        try:
+            result = self._request("POST", f"/api/runtime/enrollments/{pending['request_id']}/poll", {"request_secret": pending["request_secret"]})
+        except HttpStatusError as exc:
+            if exc.status != 401:
+                raise
+            # Masern känner inte igen ärendet: det kan ha gått ut (24 h TTL
+            # nollar request_secret_hash) eller rensats. Att polla en död id
+            # ger 401 varje varv — tidigare loggades bara
+            # "master_request_failed status=401 retrying" i evighet. Släpp
+            # det sparade ärendet och fila ett nytt som syns i panelen.
+            LOGGER.warning("runtime_agent_enrollment_unknown request_id=%s; requesting a new enrollment",
+                           pending["request_id"])
+            return self._restart_enrollment()
         status = result.get("status")
         if status in ("pending", "rejected", "expired", "completed"):
             if status in ("rejected", "expired"):
@@ -1562,11 +1584,21 @@ class RuntimeNodeAgent:
             raise AgentError("master returned an invalid enrollment approval")
         self._set_node_id(node_id)
         self.state = {"node_id": node_id, "credential": credential, "sequence": 0,
-                      "enrollment_request_id": pending["request_id"], "enrollment_request_secret": pending["request_secret"]}
+                      "enrollment_request_id": pending["request_id"], "enrollment_request_secret": pending["request_secret"],
+                      "enrolled_via_master": True}
         if isinstance(self.runtime, DockerRuntime):
             self.runtime.state = self.state
         self.store.save(self.state)
         return self._complete_dynamic_enrollment()
+
+    def _restart_enrollment(self) -> bool:
+        """Släpp ett dött ärende och fila ett nytt (kräver ingen credential)."""
+        self.pending_enrollment = None
+        self.state = None
+        self.credential_revoked = False
+        if isinstance(self.runtime, DockerRuntime):
+            self.runtime.state = None
+        return self._request_dynamic_enrollment()
 
     def _complete_dynamic_enrollment(self) -> bool:
         assert self.state is not None
