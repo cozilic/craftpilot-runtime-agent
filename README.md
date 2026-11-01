@@ -170,6 +170,8 @@ Use one agent and one state volume per node. The named `agent_state` volume stor
 
 If the state volume is lost, ask a sysadmin to disable and re-enroll the node; do not copy credentials from another node. A disabled node’s saved credential cannot resume polling or execute commands. Re-enabling requires an explicit sysadmin action and a fresh registration token in `.env`.
 
+If an admin deletes the node at the master, the agent’s next authenticated request is rejected. Instead of idling, the agent files a **replacement enrollment request** (same hostname, new request ID) so the node shows up again in the panel’s pending **Agent requests** list (`Agentförfrågningar`). Approve it to give the host a new node identity; the deleted node’s servers can be adopted from that node during approval. If the request is denied, the agent stays idle and waits for a fresh `CRAFTPILOT_REGISTRATION_TOKEN` rather than filing new requests. A registration token that is still present from an earlier setup is discarded once the master rejects it.
+
 ## Configuration
 
 The checked-in `.env.example` provides safe defaults, including `CRAFTPILOT_MASTER_URL=https://craftpilot.se`. Linux setup fills in the host-specific `DOCKER_GID`; the macOS and Windows launchers configure the Docker Desktop/WSL socket group. No registration token is needed for initial self-enrollment.
@@ -243,7 +245,7 @@ Run the Docker-free agent test suite (requires Python 3.13 or later on the test 
 python3 -m unittest discover -s . -p 'test_*.py'
 ```
 
-Before production use, validate enrollment and credential persistence, heartbeat replay rejection, start/stop, lease expiry and retry, revoked-credential waiting and authorized re-enrollment, node outage behavior, firewall rules, and actual Minecraft connectivity. Perform end-to-end runtime checks on a disposable Linux Docker host and a staging CraftPilot master; a successful container start alone does not prove players can connect.
+Before production use, validate enrollment and credential persistence, heartbeat replay rejection, start/stop, lease expiry and retry, revoked-credential replacement enrollment (approved and denied), node outage behavior, firewall rules, and actual Minecraft connectivity. Perform end-to-end runtime checks on a disposable Linux Docker host and a staging CraftPilot master; a successful container start alone does not prove players can connect.
 
 ## Manual Docker installation
 

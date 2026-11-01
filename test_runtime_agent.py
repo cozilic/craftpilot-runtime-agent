@@ -147,93 +147,111 @@ class EnrollmentTests(unittest.TestCase):
             self.agent.poll_enrollment_once()
         self.assertIsNone(self.agent.state)
 
-    def test_revoked_credential_stays_inert_until_operator_supplies_fresh_token(self):
-        node_id = "9f4a2d91-728a-4e9e-a4a2-a580f263da67"
-        credential = "c" * 64
-        self.config = Config(
+    def _revoked_agent(self, node_id, registration_token=None):
+        config = Config(
             master_url=self.config.master_url,
             node_id=node_id,
-            registration_token=None,
+            registration_token=registration_token,
             state_dir=self.config.state_dir,
             data_root=self.config.data_root,
             images=self.config.images,
         )
-        self.agent = RuntimeNodeAgent(
-            self.config, runtime=SimpleNamespace(config=self.config), store=agent_module.StateStore(self.config.state_dir),
-        )
-        self.agent.state = {"node_id": node_id, "credential": credential, "sequence": 7}
+        agent = RuntimeNodeAgent(config, runtime=SimpleNamespace(config=config), store=agent_module.StateStore(config.state_dir))
+        agent.store.save({"node_id": node_id, "credential_revoked": True})
+        return agent
 
-        self.agent._mark_credential_revoked()
+    def test_revoked_credential_files_a_replacement_enrollment_without_a_token(self):
+        node_id = "9f4a2d91-728a-4e9e-a4a2-a580f263da67"
+        request_id = "9f4a2d91-728a-4e9e-a4a2-a580f263da66"
+        self.agent = self._revoked_agent(node_id)
+        calls = []
+
+        def request(method, path, body, credential=False):
+            calls.append((method, path, credential))
+            if path == "/api/runtime/enrollments":
+                return {"request_id": request_id, "request_secret": "s" * 64}
+            raise AssertionError(path)
+
+        self.agent._request = request
+        self.assertFalse(self.agent.ensure_registered())
+        self.assertFalse(self.agent.credential_revoked)
+        self.assertEqual([("POST", "/api/runtime/enrollments", False)], calls)
+        self.assertEqual({"node_id": node_id, "enrollment_request_id": request_id,
+                          "enrollment_request_secret": "s" * 64}, self.agent.store.load())
+        self.assertEqual(request_id, self.agent.pending_enrollment["request_id"])
+
+    def test_stale_registration_token_falls_back_to_a_replacement_enrollment(self):
+        node_id = "9f4a2d91-728a-4e9e-a4a2-a580f263da67"
+        request_id = "9f4a2d91-728a-4e9e-a4a2-a580f263da66"
+        self.agent = self._revoked_agent(node_id, registration_token="t" * 64)
+        calls = []
+
+        def request(method, path, body, credential=False):
+            calls.append((method, path))
+            if path == f"/api/runtime/nodes/{node_id}/register":
+                raise agent_module.HttpStatusError(401)
+            if path == "/api/runtime/enrollments":
+                return {"request_id": request_id, "request_secret": "s" * 64}
+            raise AssertionError(path)
+
+        self.agent._request = request
+        self.assertFalse(self.agent.ensure_registered())
+        self.assertFalse(self.agent.credential_revoked)
+        self.assertEqual([("POST", f"/api/runtime/nodes/{node_id}/register"),
+                          ("POST", "/api/runtime/enrollments")], calls)
+        self.assertIsNone(self.agent.config.registration_token)
+        self.assertEqual(node_id, self.agent.store.load()["node_id"])
+        self.assertEqual(request_id, self.agent.store.load()["enrollment_request_id"])
+
+    def test_failed_replacement_enrollment_keeps_the_agent_inert(self):
+        node_id = "9f4a2d91-728a-4e9e-a4a2-a580f263da67"
+        self.agent = self._revoked_agent(node_id)
+        self.agent._request = lambda *_args, **_kwargs: (_ for _ in ()).throw(AgentError("master unavailable"))
+
+        self.assertFalse(self.agent.ensure_registered())
         self.assertTrue(self.agent.credential_revoked)
         self.assertIsNone(self.agent.state)
         self.assertEqual({"node_id": node_id, "credential_revoked": True}, self.agent.store.load())
 
-        calls = []
-        self.agent._request = lambda *args, **kwargs: calls.append(args) or self.fail("must not enroll without an operator-provided token")
-        self.assertFalse(self.agent.ensure_registered())
-        self.assertTrue(self.agent.credential_revoked)
-        self.assertIsNone(self.agent.state)
-        self.assertEqual([], calls)
-
+    def test_fresh_registration_token_still_reattaches_the_node(self):
+        node_id = "9f4a2d91-728a-4e9e-a4a2-a580f263da67"
         token = "t" * 64
-        self.agent.config = Config(
-            master_url=self.config.master_url,
-            node_id=node_id,
-            registration_token=token,
-            state_dir=self.config.state_dir,
-            data_root=self.config.data_root,
-            images=self.config.images,
-        )
-        self.agent.runtime.config = self.agent.config
+        self.agent = self._revoked_agent(node_id, registration_token=token)
+        calls = []
 
         def request(method, path, body, credential=False):
-            calls.append((method, path, body, credential))
+            calls.append((method, path, body))
             return {"node_id": node_id, "credential": "n" * 64, "master_url": self.config.master_url}
 
         self.agent._request = request
         self.assertTrue(self.agent.ensure_registered())
         self.assertFalse(self.agent.credential_revoked)
         self.assertEqual("n" * 64, self.agent.state["credential"])
-        self.assertEqual(1, len(calls))
-        self.assertEqual("/api/runtime/nodes/%s/register" % node_id, calls[0][1])
-        self.assertEqual(token, calls[0][2]["registration_token"])
+        self.assertEqual([("POST", f"/api/runtime/nodes/{node_id}/register", {"registration_token": token})], calls)
         self.assertIsNone(self.agent.config.registration_token)
         self.assertNotIn("credential_revoked", self.agent.store.load())
 
-    def test_revoked_credential_waits_when_no_fresh_registration_token_is_available(self):
+    def test_marking_a_credential_revoked_discards_it_and_keeps_the_node_id(self):
         node_id = "9f4a2d91-728a-4e9e-a4a2-a580f263da67"
-        self.agent.store.save({"node_id": node_id, "credential_revoked": True})
-        calls = []
-        self.agent._request = lambda *args, **kwargs: calls.append(args) or self.fail("must not register without a token")
+        self.agent = self._revoked_agent(node_id)
+        self.agent.state = {"node_id": node_id, "credential": "c" * 64, "sequence": 7}
 
-        self.assertFalse(self.agent.ensure_registered())
-        self.assertTrue(self.agent.credential_revoked)
-        self.assertEqual([], calls)
-        self.assertEqual({"node_id": node_id, "credential_revoked": True}, self.agent.store.load())
-
-    def test_revoked_credential_keeps_waiting_when_registration_token_is_stale(self):
-        node_id = "9f4a2d91-728a-4e9e-a4a2-a580f263da67"
-        config = Config(
-            master_url=self.config.master_url,
-            node_id=node_id,
-            registration_token="t" * 64,
-            state_dir=self.config.state_dir,
-            data_root=self.config.data_root,
-            images=self.config.images,
-        )
-        self.agent = RuntimeNodeAgent(config, runtime=SimpleNamespace(config=config), store=self.agent.store)
-        self.agent.store.save({"node_id": node_id, "credential_revoked": True})
-        calls = []
-
-        def unauthorized(*_args, **_kwargs):
-            calls.append("attempt")
-            raise agent_module.HttpStatusError(401)
-
-        self.agent._request = unauthorized
-        self.assertFalse(self.agent.ensure_registered())
+        self.agent._mark_credential_revoked()
         self.assertTrue(self.agent.credential_revoked)
         self.assertIsNone(self.agent.state)
-        self.assertEqual(["attempt"], calls)
+        self.assertEqual({"node_id": node_id, "credential_revoked": True}, self.agent.store.load())
+
+    def test_rejected_replacement_enrollment_waits_for_a_fresh_token(self):
+        node_id = "9f4a2d91-728a-4e9e-a4a2-a580f263da67"
+        request_id = "9f4a2d91-728a-4e9e-a4a2-a580f263da66"
+        self.agent.store.save({"node_id": node_id, "enrollment_request_id": request_id,
+                               "enrollment_request_secret": "s" * 64})
+        self.agent.pending_enrollment = {"request_id": request_id, "request_secret": "s" * 64}
+        self.agent._request = lambda *_args, **_kwargs: {"status": "rejected"}
+
+        self.assertFalse(self.agent.poll_enrollment_once())
+        self.assertTrue(self.agent.credential_revoked)
+        self.assertIsNone(self.agent.pending_enrollment)
         self.assertEqual({"node_id": node_id, "credential_revoked": True}, self.agent.store.load())
 
     def test_only_401_from_authenticated_requests_is_a_revoked_credential(self):

@@ -1433,36 +1433,39 @@ class RuntimeNodeAgent:
             self.runtime.state = None
 
         token = self.config.registration_token
-        if token is None or not 32 <= len(token) <= 128:
-            return False
+        if isinstance(token, str) and 32 <= len(token) <= 128:
+            try:
+                result = self._request("POST", f"/api/runtime/nodes/{node_id}/register",
+                                       {"registration_token": token})
+            except HttpStatusError as exc:
+                if exc.status != 401:
+                    raise
+                LOGGER.warning("runtime_agent_reenrollment_token_rejected node_id=%s; requesting a replacement enrollment", node_id)
+                self._clear_registration_token()
+            except AgentError as exc:
+                LOGGER.warning("runtime_agent_reenrollment_failed node_id=%s error=%s", node_id, str(exc)[:220])
+                return False
+            else:
+                credential = result.get("credential")
+                if result.get("node_id") != node_id or not isinstance(credential, str) or not re.fullmatch(r"[A-Za-z0-9]{64}", credential):
+                    raise AgentError("master returned an invalid registration response")
+                master_url = result.get("master_url", self.config.master_url)
+                if not isinstance(master_url, str) or master_url.rstrip("/") != self.config.master_url:
+                    raise AgentError("registration response master URL does not match configured HTTPS origin")
 
-        try:
-            result = self._request("POST", f"/api/runtime/nodes/{node_id}/register",
-                                   {"registration_token": token})
-        except HttpStatusError as exc:
-            if exc.status != 401:
-                raise
-            LOGGER.warning("runtime_agent_reenrollment_token_rejected node_id=%s; waiting for a fresh token", node_id)
-            return False
-        except AgentError as exc:
-            LOGGER.warning("runtime_agent_reenrollment_failed node_id=%s error=%s", node_id, str(exc)[:220])
-            return False
+                self.state = {"node_id": node_id, "credential": credential, "sequence": 0}
+                if isinstance(self.runtime, DockerRuntime):
+                    self.runtime.state = self.state
+                self.store.save(self.state)
+                self.credential_revoked = False
+                self._clear_registration_token()
+                LOGGER.info("runtime_agent_online node_id=%s", node_id)
+                return True
 
-        credential = result.get("credential")
-        if result.get("node_id") != node_id or not isinstance(credential, str) or not re.fullmatch(r"[A-Za-z0-9]{64}", credential):
-            raise AgentError("master returned an invalid registration response")
-        master_url = result.get("master_url", self.config.master_url)
-        if not isinstance(master_url, str) or master_url.rstrip("/") != self.config.master_url:
-            raise AgentError("registration response master URL does not match configured HTTPS origin")
-
-        self.state = {"node_id": node_id, "credential": credential, "sequence": 0}
-        if isinstance(self.runtime, DockerRuntime):
-            self.runtime.state = self.state
-        self.store.save(self.state)
-        self.credential_revoked = False
-        self._clear_registration_token()
-        LOGGER.info("runtime_agent_online node_id=%s", node_id)
-        return True
+        # Noden finns inte kvar hos mastern (borttagen) och ingen giltig
+        # registreringstoken finns: be om ett nytt godkännande i stället för
+        # att vänta i det tysta. Ärendet syns under Agent Requests i panelen.
+        return self._request_replacement_enrollment(node_id)
 
     def _clear_registration_token(self) -> None:
         from dataclasses import replace
@@ -1481,7 +1484,7 @@ class RuntimeNodeAgent:
         if isinstance(self.runtime, DockerRuntime):
             self.runtime.state = None
         self.credential_revoked = True
-        LOGGER.error("runtime_agent_credential_revoked node_id=%s action=waiting_for_manual_reenrollment",
+        LOGGER.error("runtime_agent_credential_revoked node_id=%s action=awaiting_new_enrollment",
                      node_id or "unknown")
 
     def _set_node_id(self, node_id: str) -> None:
@@ -1489,16 +1492,39 @@ class RuntimeNodeAgent:
         self.config = replace(self.config, node_id=node_id)
         self.runtime.config = self.config
 
-    def _request_dynamic_enrollment(self) -> bool:
+    def _post_enrollment_request(self) -> tuple[str, str]:
         result = self._request("POST", "/api/runtime/enrollments", {
             "hostname": socket.gethostname()[:255] or "craftpilot-agent", "agent_version": "local-docker",
         })
         request_id, request_secret = result.get("request_id"), result.get("request_secret")
         if not isinstance(request_id, str) or not UUID_RE.fullmatch(request_id) or not isinstance(request_secret, str) or not re.fullmatch(r"[A-Za-z0-9]{64}", request_secret):
             raise AgentError("master returned an invalid enrollment request")
+        return request_id, request_secret
+
+    def _request_dynamic_enrollment(self) -> bool:
+        request_id, request_secret = self._post_enrollment_request()
         self.pending_enrollment = {"request_id": request_id, "request_secret": request_secret}
         self.store.save({"node_id": None, "enrollment_request_id": request_id, "enrollment_request_secret": request_secret})
         LOGGER.info("enrollment_waiting request_id=%s", request_id)
+        return False
+
+    def _request_replacement_enrollment(self, node_id: str) -> bool:
+        """Noden är borta hos mastern: fila ett ärende som syns i panelen.
+
+        Det gamla ``node_id`` sparas tillsammans med ärendet. Avvisas ärendet
+        återgår agenten till att vänta på en ny registreringstoken i stället
+        för att fila ett nytt ärende vid varje varv.
+        """
+        try:
+            request_id, request_secret = self._post_enrollment_request()
+        except (AgentError, HttpStatusError) as exc:
+            LOGGER.warning("runtime_agent_replacement_enrollment_failed node_id=%s error=%s", node_id, str(exc)[:220])
+            self.credential_revoked = True
+            return False
+        self.credential_revoked = False
+        self.pending_enrollment = {"request_id": request_id, "request_secret": request_secret}
+        self.store.save({"node_id": node_id, "enrollment_request_id": request_id, "enrollment_request_secret": request_secret})
+        LOGGER.warning("runtime_agent_replacement_enrollment_requested node_id=%s request_id=%s", node_id, request_id)
         return False
 
     def poll_enrollment_once(self) -> bool:
@@ -1514,6 +1540,19 @@ class RuntimeNodeAgent:
         status = result.get("status")
         if status in ("pending", "rejected", "expired", "completed"):
             if status in ("rejected", "expired"):
+                saved = self.store.load() or {}
+                node_id = saved.get("node_id")
+                if isinstance(node_id, str) and UUID_RE.fullmatch(node_id):
+                    # Ett ersättningsärende avslogs: stanna i ett lugnt läge och
+                    # vänta på en ny registreringstoken i stället för att fila
+                    # nya ärenden.
+                    self.pending_enrollment = None
+                    self.state = None
+                    self.credential_revoked = True
+                    self.store.save({"node_id": node_id, "credential_revoked": True})
+                    LOGGER.warning("runtime_agent_replacement_enrollment_%s node_id=%s; waiting for a fresh token",
+                                   status, node_id)
+                    return False
                 raise AgentError(f"runtime enrollment request was {status}")
             return status == "completed"
         node_id, credential, master_url = result.get("node_id"), result.get("credential"), result.get("master_url")
