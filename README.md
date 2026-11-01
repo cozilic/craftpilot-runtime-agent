@@ -99,13 +99,14 @@ Instead of pointing at the production master, one checkout can talk to a CraftPi
 ### Prerequisites
 
 - The local CraftPilot stack is running (`docker compose up -d` in the CraftPilot checkout). Its Compose network is normally `craftpilot_default`; set `CRAFTPILOT_MASTER_NETWORK` if the checkout directory differs.
-- The local TLS bridge has a CA. Create it once in the CraftPilot checkout if `runtime-agent/local-certs/` is missing:
+- The local TLS bridge has a CA. The certificate script lives in the **CraftPilot** repository (`runtime-agent/create-local-certs.sh`), not in this one; run it from that checkout:
 
   ```sh
+  cd ../CraftPilot
   bash runtime-agent/create-local-certs.sh
   ```
 
-  Use that checkout's `runtime-agent/local-certs/ca.crt` as `--ca-file` below.
+  It refuses to overwrite existing material, so skip it when `runtime-agent/local-certs/ca.crt` already exists. Either way, pass that checkout's `runtime-agent/local-certs/ca.crt` as `--ca-file` below — for example `C:\Projects\CraftPilot\runtime-agent\local-certs\ca.crt` on Windows.
 
 ### Start
 
