@@ -861,6 +861,8 @@ class DockerRuntimeTests(unittest.TestCase):
         self.assertIn("enable-rcon=true", content)
         self.assertIn("rcon.port=25575", content)
         self.assertIn("rcon.ip=0.0.0.0", content)
+        self.assertIn("pause-when-empty-seconds=0", content)
+        self.assertEqual(1, content.count("pause-when-empty-seconds="))
         self.assertEqual(1, content.count("rcon.password="))
         self.assertIn(f"rcon.password={first_password}", content)
         self.assertIn("motd=Keep this", content)
@@ -1588,6 +1590,77 @@ class ConsoleTickTests(unittest.TestCase):
 
         self.assertEqual([], calls)
 
+
+class RconDeliveryTests(unittest.TestCase):
+    """Konsolkommandon ska inte tappas för att RCON svarar en sekund sent."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.config = make_config(Path(self.temporary.name))
+        self.networks = [json.dumps({"craftpilot-servers": {"IPAddress": "172.24.0.6"}}) for _ in range(8)]
+        self.runtime = DockerRuntime(self.config, FakeDocker(self.networks))
+        self.runtime.state = {"node_id": self.config.node_id, "credential": "c" * 64,
+                              "sequence": 1, "rcon_passwords": {SERVER_ID: "a" * 64}}
+
+    @staticmethod
+    def _packet(request_id, packet_type, body=b""):
+        payload = body + b"\0\0"
+        length = 8 + len(payload)
+        return (length.to_bytes(4, "little", signed=True) + request_id.to_bytes(4, "little", signed=True)
+                + packet_type.to_bytes(4, "little", signed=True) + payload)
+
+    def _session_connection(self):
+        buffer = bytearray()
+        sends = {"count": 0}
+
+        class FakeConnection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def settimeout(self, _value):
+                return None
+
+            def sendall(self, _data):
+                sends["count"] += 1
+                buffer.extend(RconDeliveryTests._packet(1, 2) if sends["count"] == 1
+                              else RconDeliveryTests._packet(2, 0, b"players"))
+
+            def recv(self, size):
+                chunk = bytes(buffer[:size])
+                del buffer[:size]
+                return chunk
+
+        return FakeConnection()
+
+    def test_console_retries_a_refused_connection_then_succeeds(self):
+        timeouts = []
+
+        def create_connection(_address, timeout=None):
+            timeouts.append(timeout)
+            if len(timeouts) == 1:
+                raise ConnectionRefusedError("RCON listener not ready")
+            return self._session_connection()
+
+        with patch.object(agent_module.socket, "create_connection", side_effect=create_connection), \
+                patch.object(agent_module.time, "sleep", return_value=None) as sleep:
+            self.runtime._send_rcon(SERVER_ID, CONTAINER_NAME, "list")
+
+        self.assertEqual(2, len(timeouts))
+        self.assertEqual(1, sleep.call_count)
+        self.assertEqual(agent_module.RCON_TIMEOUT_SECONDS, timeouts[0])
+
+    def test_console_gives_up_after_the_bounded_attempts(self):
+        with patch.object(agent_module.socket, "create_connection",
+                          side_effect=ConnectionRefusedError("RCON listener not ready")) as create_connection, \
+                patch.object(agent_module.time, "sleep", return_value=None):
+            with self.assertRaisesRegex(agent_module.DockerError, "could not reach the Minecraft RCON endpoint"):
+                self.runtime._send_rcon(SERVER_ID, CONTAINER_NAME, "list")
+
+        self.assertEqual(agent_module.RCON_CONNECT_ATTEMPTS, create_connection.call_count)
 
 if __name__ == "__main__":
     unittest.main()

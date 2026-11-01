@@ -48,6 +48,14 @@ CONSOLE_TICK_SECONDS = 1.0
 # i stället för ett kommando per poll, så låset gäller samma sekund.
 CONSOLE_TICK_MAX_COMMANDS = 4
 
+# RCON lyssnar på containerns privata nät, men en server som precis vaknat (eller
+# Paper som pausar när den är tom) svarar inte direkt. Några korta försök räddar
+# grindens kommandon utan att normalfallet fördröjs; en pausad server ger snabbt
+# upp i stället för att hänga på en lång socket-timeout.
+RCON_CONNECT_ATTEMPTS = 3
+RCON_RETRY_SECONDS = 0.5
+RCON_TIMEOUT_SECONDS = 2.0
+
 DEFAULT_IMAGES = frozenset({
     "eclipse-temurin:8-jre", "eclipse-temurin:11-jre", "eclipse-temurin:17-jre",
     "eclipse-temurin:21-jre", "eclipse-temurin:25-jre",
@@ -1059,7 +1067,12 @@ class DockerRuntime:
             except (OSError, UnicodeError) as exc:
                 raise AgentError("server.properties is unavailable for secure console setup") from exc
         replacements = {"enable-rcon": "true", "rcon.port": "25575", "rcon.password": password,
-                        "broadcast-rcon-to-ops": "false", "rcon.ip": "0.0.0.0"}
+                        "broadcast-rcon-to-ops": "false", "rcon.ip": "0.0.0.0",
+                        # Paper pausar en tom server, och då slutar RCON svara:
+                        # panelens konsol, chatt-triggers och regelgrindens lås
+                        # (som köas direkt efter en join) tappas. Okänd nyckel
+                        # ignoreras av vanilla.
+                        "pause-when-empty-seconds": "0"}
         found: set[str] = set()
         updated: list[str] = []
         for line in lines:
@@ -1124,21 +1137,27 @@ class DockerRuntime:
             body = read_exact(length)
             return (int.from_bytes(body[:4], "little", signed=True),
                     int.from_bytes(body[4:8], "little", signed=True), body[8:-2])
-        try:
-            with socket.create_connection((address, 25575), timeout=5) as connection:
-                connection.settimeout(5)
-                connection.sendall(packet(1, 3, password))
-                auth_id, auth_type, _ = receive(connection)
-                if auth_id == -1:
-                    raise AgentError("Minecraft RCON rejected the node credential")
-                if auth_id != 1 or auth_type != 2:
-                    raise DockerError("Minecraft RCON returned an unexpected authentication response")
-                connection.sendall(packet(2, 2, command))
-                response_id, response_type, _ = receive(connection)
-                if response_id != 2 or response_type != 0:
-                    raise DockerError("Minecraft RCON returned an unexpected command response")
-        except (OSError, TimeoutError) as exc:
-            raise DockerError("could not reach the Minecraft RCON endpoint") from exc
+        last_error: OSError | TimeoutError | None = None
+        for attempt in range(RCON_CONNECT_ATTEMPTS):
+            try:
+                with socket.create_connection((address, 25575), timeout=RCON_TIMEOUT_SECONDS) as connection:
+                    connection.settimeout(RCON_TIMEOUT_SECONDS)
+                    connection.sendall(packet(1, 3, password))
+                    auth_id, auth_type, _ = receive(connection)
+                    if auth_id == -1:
+                        raise AgentError("Minecraft RCON rejected the node credential")
+                    if auth_id != 1 or auth_type != 2:
+                        raise DockerError("Minecraft RCON returned an unexpected authentication response")
+                    connection.sendall(packet(2, 2, command))
+                    response_id, response_type, _ = receive(connection)
+                    if response_id != 2 or response_type != 0:
+                        raise DockerError("Minecraft RCON returned an unexpected command response")
+                return
+            except (OSError, TimeoutError) as exc:
+                last_error = exc
+                if attempt + 1 < RCON_CONNECT_ATTEMPTS:
+                    time.sleep(RCON_RETRY_SECONDS)
+        raise DockerError("could not reach the Minecraft RCON endpoint") from last_error
 
     def _stop(self, server_id: str, name: str, force: bool, allow_docker_graceful: bool = False) -> dict[str, Any]:
         running = self._inspect(name, "{{.State.Running}}")
