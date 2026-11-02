@@ -36,6 +36,11 @@ DOCKER_ID_RE = re.compile(r"^[0-9a-f]{12,64}$", re.I)
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 USER_RE = re.compile(r"^[0-9]{1,10}:[0-9]{1,10}$")
 LOG_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$")
+# Antal loggrader som följer med i en telemetrirapport. Fönstret måste
+# rymma en chattrad även på en pratig modpack-server: agenten rapporterar
+# var 5:e sekund som default, och en `!link`-rad som hamnar utanför
+# fönstret konsumeras aldrig. Panelen tar emot samma tak (400).
+LOG_WINDOW = 400
 LOGGER = logging.getLogger("craftpilot.runtime_agent")
 
 # Snabb tick medan noden har minst en ONLINE-server: nya konsolrader skickas och
@@ -1303,7 +1308,7 @@ class DockerRuntime:
             if not LOG_TIMESTAMP_RE.fullmatch(since):
                 raise AgentError("runtime log cursor is invalid")
             args.extend(["--since", since])
-        args.extend(["--tail", "100", name])
+        args.extend(["--tail", str(LOG_WINDOW), name])
         try:
             result = self.runner(args, capture_output=True, text=True, timeout=10, check=False)
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -1333,7 +1338,7 @@ class DockerRuntime:
                     continue
                 entries.append((parsed_timestamp, stream_index, {"ts": timestamp, "text": text[-8192:]}))
         entries.sort(key=lambda entry: (entry[0], entry[1]))
-        return [entry[2] for entry in entries[-100:]]
+        return [entry[2] for entry in entries[-LOG_WINDOW:]]
 
     def _container_id(self, name: str) -> str:
         value = self._inspect(name, "{{.Id}}")
@@ -2154,7 +2159,7 @@ class RuntimeNodeAgent:
             if not LOG_TIMESTAMP_RE.fullmatch(since):
                 raise AgentError("runtime log cursor is invalid")
             args.extend(["--since", since])
-        args.extend(["--tail", "100", name])
+        args.extend(["--tail", str(LOG_WINDOW), name])
         try:
             result = self.runtime.runner(args, capture_output=True, text=True, timeout=10, check=False)
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -2184,7 +2189,7 @@ class RuntimeNodeAgent:
                     continue
                 entries.append((parsed_timestamp, stream_index, {"ts": timestamp, "text": text[-8192:]}))
         entries.sort(key=lambda entry: (entry[0], entry[1]))
-        return [entry[2] for entry in entries[-100:]]
+        return [entry[2] for entry in entries[-LOG_WINDOW:]]
 
     def _attach_runtime_network(self) -> None:
         """Se till att agenten ligger på spel-nätverket direkt vid start.

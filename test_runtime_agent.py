@@ -27,6 +27,7 @@ AgentError = agent_module.AgentError
 DockerRuntime = agent_module.DockerRuntime
 RuntimeNodeAgent = agent_module.RuntimeNodeAgent
 FileTreeIndex = agent_module.file_tree_index.FileTreeIndex
+LOG_WINDOW = agent_module.LOG_WINDOW
 
 SERVER_ID = "e7b4b542-70b0-4cf7-a2ac-2a6597de165d"
 CONTAINER_NAME = "craftpilot-e7b4b542"
@@ -1099,6 +1100,7 @@ class DockerRuntimeTests(unittest.TestCase):
         log_call = next(call for call in runner.calls if call[:2] == ["docker", "logs"])
         self.assertIn("--timestamps", log_call)
         self.assertIn("--tail", log_call)
+        self.assertIn(str(LOG_WINDOW), log_call)
 
     def test_container_logs_merge_both_streams_filter_timestamp_and_reject_bad_cursor(self):
         runner = FakeDocker([])
@@ -1116,6 +1118,22 @@ class DockerRuntimeTests(unittest.TestCase):
         self.assertEqual(["stdout-later", "stderr-error"], [line["text"] for line in logs])
         with self.assertRaisesRegex(AgentError, "cursor"):
             runtime._container_logs(CONTAINER_NAME, "not-a-timestamp")
+
+    def test_container_logs_keeps_more_than_the_old_hundred_line_window(self):
+        runner = FakeDocker([])
+        runtime = DockerRuntime(self.config, runner)
+        output = "".join(
+            f"2026-10-26T10:00:{index // 60:02d}Z rad-{index}\n" for index in range(150)
+        )
+        runtime.runner = lambda _args, **_kwargs: SimpleNamespace(returncode=0, stdout=output, stderr="")
+
+        logs = runtime._container_logs(CONTAINER_NAME)
+
+        # En `!link`-rad längre bak i fönstret får inte klippas bort: hela
+        # LOG_WINDOW följer med rapporten.
+        self.assertEqual(150, len(logs))
+        self.assertEqual("rad-0", logs[0]["text"])
+        self.assertEqual("rad-149", logs[-1]["text"])
 
 
     def test_runtime_agent_reports_only_servers_currently_assigned_by_master(self):
