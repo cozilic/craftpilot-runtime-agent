@@ -370,7 +370,9 @@ class RuntimeAgentRevocationTests(unittest.TestCase):
 
 class DockerRuntimeTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
+        # The file-tree index persists from a daemon thread, so a slow write can
+        # land while the test tears its directory down.
+        self.temporary = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.config = make_config(self.root)
@@ -378,6 +380,10 @@ class DockerRuntimeTests(unittest.TestCase):
         (self.config.data_root / SERVER_ID).mkdir()
         (self.config.data_root / SERVER_ID / "existing.txt").write_text("pre-staged")
         self.runtime = DockerRuntime(self.config, FakeDocker([]))
+
+    def _no_watcher(self):
+        """Keep the inotify thread out of cache tests that drive the index directly."""
+        return patch.object(FileTreeIndex, "start", lambda _index: None)
 
     def _make_snapshot_payload(self, archive_path: Path) -> tuple[str, dict[str, object]]:
         command_id = "f1d64bb9-2585-4d7e-b0e2-463732a212ac"
@@ -712,14 +718,26 @@ class DockerRuntimeTests(unittest.TestCase):
     def test_file_tree_index_serves_repeated_listing_without_rescanning(self):
         index = FileTreeIndex(self.config.data_root, self.config.state_dir)
         index._ready = True
-        scan = patch.object(FileTreeIndex, "scan_path", wraps=FileTreeIndex.scan_path)
-        with scan as scan_directory:
-            self.runtime.file_tree_index = index
+        self.runtime.file_tree_index = index
+        scans = []
+        scan_path, scan_directory = FileTreeIndex.scan_path, FileTreeIndex.scan_directory
+
+        def record_path(directory):
+            scans.append(("path", directory))
+            return scan_path(directory)
+
+        def record_directory(descriptor):
+            scans.append(("directory", descriptor))
+            return scan_directory(descriptor)
+
+        with self._no_watcher(),                 patch.object(FileTreeIndex, "scan_path", side_effect=record_path),                 patch.object(FileTreeIndex, "scan_directory", side_effect=record_directory):
             first = self.runtime._list_server_files(SERVER_ID, "")
             second = self.runtime._list_server_files(SERVER_ID, "")
 
         self.assertEqual(first, second)
-        self.assertEqual(1, scan_directory.call_count)
+        # A POSIX node lists through a directory fd and Windows through a path;
+        # the cache must skip the scan either way.
+        self.assertEqual(1, len(scans))
         self.assertTrue(index.index_path.is_file())
         if os.name != "nt":
             self.assertEqual(0o600, index.index_path.stat().st_mode & 0o777)
@@ -728,9 +746,10 @@ class DockerRuntimeTests(unittest.TestCase):
         index = FileTreeIndex(self.config.data_root, self.config.state_dir)
         index._ready = True
         self.runtime.file_tree_index = index
-        first = self.runtime._list_server_files(SERVER_ID, "")
-        (self.config.data_root / SERVER_ID / "new.txt").write_text("new")
-        second = self.runtime._list_server_files(SERVER_ID, "")
+        with self._no_watcher():
+            first = self.runtime._list_server_files(SERVER_ID, "")
+            (self.config.data_root / SERVER_ID / "new.txt").write_text("new")
+            second = self.runtime._list_server_files(SERVER_ID, "")
 
         self.assertNotEqual([entry["name"] for entry in first["entries"]],
                             [entry["name"] for entry in second["entries"]])
@@ -740,10 +759,10 @@ class DockerRuntimeTests(unittest.TestCase):
         index = FileTreeIndex(self.config.data_root, self.config.state_dir)
         index._ready = True
         self.runtime.file_tree_index = index
-        expected = self.runtime._list_server_files(SERVER_ID, "")
-
         self.config.state_dir.mkdir(parents=True, exist_ok=True)
-        index._persist_locked()
+        with self._no_watcher():
+            expected = self.runtime._list_server_files(SERVER_ID, "")
+            index._persist_locked()
         restored = FileTreeIndex(self.config.data_root, self.config.state_dir)
         self.assertIn(SERVER_ID, restored._directories)
         self.assertEqual(expected["entries"], restored._directories[SERVER_ID]["entries"])
@@ -753,7 +772,8 @@ class DockerRuntimeTests(unittest.TestCase):
         self.assertEqual({}, corrupt._directories)
         corrupt._ready = True
         self.runtime.file_tree_index = corrupt
-        rebuilt = self.runtime._list_server_files(SERVER_ID, "")
+        with self._no_watcher():
+            rebuilt = self.runtime._list_server_files(SERVER_ID, "")
         self.assertEqual(expected, rebuilt)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "inotify is available only on Linux")
@@ -781,10 +801,11 @@ class DockerRuntimeTests(unittest.TestCase):
         index = FileTreeIndex(self.config.data_root, self.config.state_dir)
         index._ready = True
         self.runtime.file_tree_index = index
-        first = self.runtime._list_server_files(SERVER_ID, "")
-        index.invalidate(SERVER_ID, "")
-        (self.config.data_root / SERVER_ID / "new.txt").write_text("new")
-        second = self.runtime._list_server_files(SERVER_ID, "")
+        with self._no_watcher():
+            first = self.runtime._list_server_files(SERVER_ID, "")
+            index.invalidate(SERVER_ID, "")
+            (self.config.data_root / SERVER_ID / "new.txt").write_text("new")
+            second = self.runtime._list_server_files(SERVER_ID, "")
 
         self.assertNotEqual(first, second)
         self.assertIn("new.txt", [entry["name"] for entry in second["entries"]])

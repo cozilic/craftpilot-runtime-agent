@@ -2193,10 +2193,13 @@ class RuntimeNodeAgent:
         byggts om och återskapats tappar det. Utan det kan noden inte nå RCON
         förrän nästa server-start kopplar in den igen.
         """
+        connect = getattr(self.runtime, "_connect_agent_to_runtime_network", None)
+        if connect is None:
+            return
         try:
-            self.runtime._connect_agent_to_runtime_network()
+            connect()
             LOGGER.info("runtime_network_attached network=%s", self.config.network)
-        except (DockerError, AgentError, AttributeError, OSError, TimeoutError) as exc:
+        except (DockerError, AgentError, OSError, TimeoutError) as exc:
             LOGGER.warning("runtime_network_attach_failed error=%s", str(exc)[:200])
 
     def run_forever(self) -> None:
