@@ -521,6 +521,12 @@ class DockerRuntime:
         if self._inspect(name, "{{.State.Running}}") != "true":
             raise AgentError("server container is not running")
         self._verify_managed(server_id, name)
+        # En återskapad agent tappar sitt medlemskap i spel-nätverket; RCON nås
+        # bara från det nätet. Koppla in igen innan kommandot skickas.
+        try:
+            self._connect_agent_to_runtime_network()
+        except (DockerError, OSError, TimeoutError) as exc:
+            LOGGER.warning("runtime_network_attach_failed error=%s", str(exc)[:200])
         self._send_rcon(server_id, name, command)
         LOGGER.info("server_console_command_sent server_id=%s", server_id)
         return {"success": True, "result_code": "CONSOLE_EXECUTED",
@@ -1100,7 +1106,20 @@ class DockerRuntime:
             if temporary.exists():
                 temporary.unlink()
 
+    def _agent_attached_to_runtime_network(self) -> bool:
+        """True när agent-containern redan ligger på spel-nätverket."""
+        # {{index}} renderar "<nil>" för ett saknat nät, så testa närvaro i stället.
+        result = self.runner(["docker", "inspect", "--format",
+                              f'{{{{if index .NetworkSettings.Networks "{self.config.network}"}}}}attached{{{{end}}}}',
+                              self.agent_container_name],
+                             capture_output=True, text=True, timeout=10, check=False)
+        if result.returncode != 0:
+            raise DockerError("could not inspect the agent container networks")
+        return result.stdout.strip() == "attached"
+
     def _connect_agent_to_runtime_network(self) -> None:
+        if self._agent_attached_to_runtime_network():
+            return
         result = self.runner(["docker", "network", "connect", self.config.network, self.agent_container_name],
                              capture_output=True, text=True, timeout=10, check=False)
         if result.returncode != 0 and "already exists" not in result.stderr.lower():
@@ -2167,8 +2186,22 @@ class RuntimeNodeAgent:
         entries.sort(key=lambda entry: (entry[0], entry[1]))
         return [entry[2] for entry in entries[-100:]]
 
+    def _attach_runtime_network(self) -> None:
+        """Se till att agenten ligger på spel-nätverket direkt vid start.
+
+        Nätverksmedlemskapet följer containern, inte volymen, så en agent som
+        byggts om och återskapats tappar det. Utan det kan noden inte nå RCON
+        förrän nästa server-start kopplar in den igen.
+        """
+        try:
+            self.runtime._connect_agent_to_runtime_network()
+            LOGGER.info("runtime_network_attached network=%s", self.config.network)
+        except (DockerError, AgentError, AttributeError, OSError, TimeoutError) as exc:
+            LOGGER.warning("runtime_network_attach_failed error=%s", str(exc)[:200])
+
     def run_forever(self) -> None:
         self.file_tree_index.start()
+        self._attach_runtime_network()
         if self.ensure_registered():
             LOGGER.info("runtime_agent_online node_id=%s", self.config.node_id)
         while True:

@@ -66,7 +66,8 @@ class FakeDocker:
     def __call__(self, args, **kwargs):
         self.calls.append(list(args))
         if args[:3] == ["docker", "inspect", "--format"]:
-            value = self.inspect_values.pop(0)
+            # En agent som inte ligger på spel-nätverket svarar "<no value>".
+            value = self.inspect_values.pop(0) if self.inspect_values else ""
             if value == "__missing__":
                 return SimpleNamespace(returncode=1, stdout="", stderr="No such object")
             return SimpleNamespace(returncode=0, stdout=value + "\n", stderr="")
@@ -821,7 +822,7 @@ class DockerRuntimeTests(unittest.TestCase):
     def test_start_creates_only_expected_container_with_limits_and_labels(self):
         (self.config.data_root / SERVER_ID / "existing.txt").unlink()
         (self.config.data_root / SERVER_ID / "server.properties").write_text("motd=Test\nenable-rcon=false\n")
-        runner = FakeDocker(["__missing__", "true", "b" * 64])
+        runner = FakeDocker(["__missing__", "<no value>", "true", "b" * 64])
         runtime = DockerRuntime(self.config, runner)
         runtime.state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 0}
         runtime.state_store = MemoryStateStore()
@@ -891,7 +892,7 @@ class DockerRuntimeTests(unittest.TestCase):
         )
         (self.config.data_root / SERVER_ID / "server.properties").write_text("motd=Test\n")
         state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 0}
-        runner = FakeDocker(["__missing__", "true", "b" * 64])
+        runner = FakeDocker(["__missing__", "<no value>", "true", "b" * 64])
         result_runtime = DockerRuntime(self.config, runner)
         result_runtime.state = state
         result_runtime.state_store = MemoryStateStore()
@@ -899,7 +900,7 @@ class DockerRuntimeTests(unittest.TestCase):
             "start", {"server_id": SERVER_ID, "container": make_spec(self.config)},
         )
         self.assertEqual("STARTED", result["result_code"])
-        runtime_runner = FakeDocker(["__missing__", "true", "b" * 64])
+        runtime_runner = FakeDocker(["__missing__", "<no value>", "true", "b" * 64])
         runtime = DockerRuntime(self.config, runtime_runner)
         runtime.state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 0}
         runtime.state_store = MemoryStateStore()
@@ -946,6 +947,30 @@ class DockerRuntimeTests(unittest.TestCase):
             with self.subTest(command=repr(command)):
                 with self.assertRaises(AgentError):
                     runtime.execute("console", {"server_id": SERVER_ID, "command": command})
+
+    def test_agent_network_attach_is_idempotent_and_heals_a_recreated_agent(self):
+        attached = FakeDocker(['attached'])
+        DockerRuntime(self.config, attached)._connect_agent_to_runtime_network()
+        self.assertFalse(any(call[:3] == ["docker", "network", "connect"] for call in attached.calls))
+
+        missing = FakeDocker([""])
+        DockerRuntime(self.config, missing)._connect_agent_to_runtime_network()
+        connects = [call for call in missing.calls if call[:3] == ["docker", "network", "connect"]]
+        self.assertEqual([[self.config.network, "craftpilot-runtime-agent"]], [call[3:] for call in connects])
+
+    def test_console_reattaches_the_agent_to_the_game_network_before_rcon(self):
+        runner = FakeDocker(["true", json.dumps({
+            "craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID,
+        }), ""])
+        runtime = DockerRuntime(self.config, runner)
+        runtime.state = {"rcon_passwords": {SERVER_ID: "a" * 64}}
+        runtime._send_rcon = lambda *_args: None
+
+        runtime.execute("console", {"server_id": SERVER_ID, "command": "list"})
+
+        connect_index = next(index for index, call in enumerate(runner.calls)
+                             if call[:3] == ["docker", "network", "connect"])
+        self.assertEqual([self.config.network, "craftpilot-runtime-agent"], runner.calls[connect_index][3:])
 
     def test_console_refuses_foreign_container_and_offline_state(self):
         foreign = DockerRuntime(self.config, FakeDocker(["true", json.dumps({
