@@ -19,6 +19,7 @@ The current agent supports a focused set of operations:
 - **Start and stop** for managed Minecraft containers.
 - **Console command delivery** over authenticated RCON.
 - **Node and server telemetry**, including container status, resource usage, uptime, disk usage, and a bounded log stream.
+- **Process servers** (`runtime_kind=process`): the same start/stop/console/log/telemetry contract for servers the master runs as plain java processes on a node without Docker, chosen per server from the Java version the master asks for.
 
 The agent does **not** currently migrate existing worlds or provide remote file operations. A running container does not by itself guarantee player connectivity: the node operator must configure the firewall and ensure the CraftPilot Gate can reach the node’s advertised Minecraft address and ports.
 
@@ -208,6 +209,7 @@ The checked-in `.env.example` provides safe defaults, including `CRAFTPILOT_MAST
 | `CRAFTPILOT_REGISTRATION_TOKEN` | Empty | One-time token used only when an explicitly disabled node is re-enabled. Remove it after registration succeeds. |
 | `CRAFTPILOT_SERVER_DATA_GID` | `33` | Group used for shared server data; matches the default Minecraft container user (`33:33`). |
 | `CRAFTPILOT_DOCKER_NETWORK` | `craftpilot-servers` | Isolated bridge network for game containers. |
+| `CRAFTPILOT_JAVA_BINARIES` | Empty | Process nodes only: JRE per Java major version, e.g. `21=/opt/jdk-21/bin/java,17=/opt/jdk-17/bin/java`. Absolute paths; a server whose version is missing is refused instead of run on the wrong JRE. |
 | `CRAFTPILOT_ALLOWED_IMAGES` | Temurin JRE 8, 11, 17, 21 and 25 images | Comma-separated exact image allowlist. |
 | `CRAFTPILOT_POLL_SECONDS` | `30` | Polling interval; allowed range is 5–120 seconds. |
 | `CRAFTPILOT_STOP_GRACE_SECONDS` | `30` | Graceful stop timeout; allowed range is 0–45 seconds. |
@@ -216,6 +218,12 @@ The checked-in `.env.example` provides safe defaults, including `CRAFTPILOT_MAST
 | `CRAFTPILOT_MASTER_NETWORK` | `craftpilot_default` | Local mode only: external Compose network of the local CraftPilot stack. |
 
 Setup updates only platform-dependent settings; other `.env` values are preserved. Keep `.env` private and do not commit it.
+
+### Process nodes (no Docker)
+
+A node registered with `runtime_kind=process` runs its servers as local java processes instead of containers. The master sends the validated argv, the required Java major version, the port and the memory limit; the agent runs that argv verbatim (no shell), in the server's staged data directory, and only replaces the `java` token with the binary configured for that version in `CRAFTPILOT_JAVA_BINARIES`. A native server binary (`./pumpkin`-style argv) needs no JRE at all.
+
+Stop uses the server's own `stop` console command and falls back to SIGTERM; force stop uses SIGKILL. Process state and the last exit code live in `processes.json` in the agent state directory, so a crashed server reports `CRASHED` with its code, a clean or intentional stop reports `OFFLINE`, and console lines are tailed from `process-logs/<server-id>.log` with the same dedupe cursor as containers. CPU and memory figures are not collected for process servers; the memory limit is reported as configured.
 
 ## Operations and safety
 

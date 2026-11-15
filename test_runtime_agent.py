@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import importlib.util
 import json
 import os
@@ -1596,6 +1597,9 @@ class ConsoleTickTests(unittest.TestCase):
             def _container_logs(self, name, since=None):
                 return [] if since is not None else [dict(join_line)]
 
+            def _logs_for_server(self, server_id, name, since=None):
+                return self._container_logs(name, since)
+
             def execute(self, command_type, payload, credential=None, command_id=None):
                 executed.append((command_type, payload))
                 return {"success": True, "result_code": "CONSOLE_EXECUTED"}
@@ -1725,6 +1729,289 @@ class RconDeliveryTests(unittest.TestCase):
                 self.runtime._send_rcon(SERVER_ID, CONTAINER_NAME, "list")
 
         self.assertEqual(agent_module.RCON_CONNECT_ATTEMPTS, create_connection.call_count)
+
+
+class FakeProcess:
+    """Minimal Popen-ersättare: argv, stdin-buffer och styrbar exit-kod."""
+
+    def __init__(self, argv, returncode=None, **options):
+        self.argv = list(argv)
+        self.options = options
+        self.pid = 987654
+        self.stdin = io.BytesIO()
+        self.returncode = returncode
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return 0 if self.returncode is None else self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        if self.returncode is None:
+            self.returncode = 0
+
+    def kill(self):
+        self.killed = True
+        if self.returncode is None:
+            self.returncode = -9
+
+
+class ProcessRuntimeTests(unittest.TestCase):
+    """Process-noder: java_major, argv och exit-koder utan Docker."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.config = make_config(self.root)
+        self.config.data_root.mkdir()
+        self.server_root = self.config.data_root / SERVER_ID
+        self.server_root.mkdir()
+        (self.server_root / "server.jar").write_text("jar")
+        self.java = self.root / "jdk21" / "bin" / "java"
+        self.java.parent.mkdir(parents=True)
+        self.java.write_text("#!/bin/sh\n")
+        self.alive = True
+        self.spawned = []
+        self.runtime = DockerRuntime(self.config, FakeDocker([]))
+        self.supervisor = self._supervisor()
+
+    def _config(self, java_binaries=None):
+        return Config(
+            master_url=self.config.master_url,
+            node_id=self.config.node_id,
+            registration_token=None,
+            state_dir=self.config.state_dir,
+            data_root=self.config.data_root,
+            images=self.config.images,
+            java_binaries=java_binaries if java_binaries is not None else {21: str(self.java)},
+        )
+
+    def _supervisor(self, returncode=None, java_binaries=None):
+        def popen(argv, **options):
+            process = FakeProcess(argv, returncode=returncode, **options)
+            self.spawned.append(process)
+            return process
+
+        supervisor = agent_module.process_runtime.ProcessSupervisor(
+            self._config(java_binaries), popen=popen, sleep=lambda _seconds: None,
+        )
+        supervisor._alive = lambda pid: self.alive and isinstance(pid, int) and pid > 0
+        self.runtime.processes = supervisor
+        return supervisor
+
+    @staticmethod
+    def _spec(**overrides):
+        spec = {
+            "java_major": 21, "native_binary": False,
+            "command": ["java", "-Xms1024M", "-Xmx2048M", "-jar", "server.jar", "nogui"],
+            "port": 25571, "memory_mb": 2048, "cpus": 2.0,
+        }
+        spec.update(overrides)
+        return spec
+
+    def _start(self, **overrides):
+        return self.supervisor.start(SERVER_ID, self._spec(**overrides), self.server_root)
+
+    def test_start_spawns_the_masters_argv_with_the_configured_jre(self):
+        result = self._start()
+
+        self.assertEqual("STARTED", result["result_code"])
+        self.assertEqual(f"process-{SERVER_ID.replace('-', '')[:8]}", result["container_id"])
+        process = self.spawned[-1]
+        self.assertEqual([str(self.java), "-Xms1024M", "-Xmx2048M", "-jar", "server.jar", "nogui"], process.argv)
+        self.assertEqual(str(self.server_root.resolve()), process.options["cwd"])
+        self.assertIs(agent_module.subprocess.PIPE, process.options["stdin"])
+        self.assertTrue(process.options["start_new_session"])
+        self.assertNotIn("shell", process.options)
+        record = self.supervisor.record(SERVER_ID)
+        self.assertEqual(987654, record["pid"])
+        self.assertEqual(21, record["java_major"])
+        self.assertEqual(2048, record["memory_limit_mb"])
+        self.assertTrue(Path(record["log"]).exists())
+
+    def test_start_is_idempotent_for_a_running_process(self):
+        self._start()
+        result = self._start()
+
+        self.assertEqual("ALREADY_RUNNING", result["result_code"])
+        self.assertEqual(1, len(self.spawned), "Ett andra startanrop får inte spawna en ny JVM")
+
+    def test_start_refuses_a_java_version_this_node_has_no_binary_for(self):
+        with self.assertRaisesRegex(agent_module.process_runtime.ProcessError,
+                                    "no Java 25 runtime is configured on this node"):
+            self._start(java_major=25)
+
+        self.assertEqual([], self.spawned)
+        self.assertIsNone(self.supervisor.record(SERVER_ID))
+
+    def test_start_refuses_a_configured_binary_that_is_missing(self):
+        supervisor = self._supervisor(java_binaries={21: str(self.root / "missing" / "java")})
+
+        with self.assertRaisesRegex(agent_module.process_runtime.ProcessError, "does not exist"):
+            supervisor.start(SERVER_ID, self._spec(), self.server_root)
+        self.assertEqual([], self.spawned)
+
+    def test_start_refuses_an_argv_that_is_not_a_java_command(self):
+        with self.assertRaisesRegex(agent_module.process_runtime.ProcessError,
+                                    "must start with the java token"):
+            self._start(command=["bash", "-c", "id"])
+
+        self.assertEqual([], self.spawned)
+
+    def test_native_binary_runs_without_any_jre(self):
+        result = self._start(java_major=None, native_binary=True, command=["./pumpkin"])
+
+        self.assertEqual("STARTED", result["result_code"])
+        self.assertEqual(["./pumpkin"], self.spawned[-1].argv)
+        self.assertIsNone(self.supervisor.record(SERVER_ID)["java_major"])
+
+    def test_start_refuses_a_data_path_outside_the_configured_root(self):
+        with self.assertRaisesRegex(agent_module.process_runtime.ProcessError, "escapes the configured root"):
+            self.supervisor.start(SERVER_ID, self._spec(), self.config.data_root)
+
+        self.assertEqual([], self.spawned)
+
+    def test_start_reports_a_process_that_dies_immediately(self):
+        supervisor = self._supervisor(returncode=1)
+
+        with self.assertRaisesRegex(agent_module.process_runtime.ProcessError, "exited immediately with code 1"):
+            supervisor.start(SERVER_ID, self._spec(), self.server_root)
+        self.assertIsNone(supervisor.record(SERVER_ID), "En död process får inte lämnas som ägd server")
+
+    def test_graceful_stop_writes_stop_to_stdin_and_forgets_the_record(self):
+        self._start()
+
+        result = self.supervisor.stop(SERVER_ID, force=False)
+
+        self.assertEqual("STOPPED", result["result_code"])
+        self.assertTrue(self.spawned[-1].stdin.getvalue().endswith(b"stop\n"))
+        # Posten behålls som stoppad så rapporten vet att servern ägs här.
+        record = self.supervisor.record(SERVER_ID)
+        self.assertIsNone(record["pid"])
+        self.assertEqual(("exited", 0), self.supervisor.status(SERVER_ID))
+
+    def test_force_stop_kills_the_process(self):
+        self._start()
+
+        result = self.supervisor.stop(SERVER_ID, force=True)
+
+        self.assertEqual("STOPPED", result["result_code"])
+        self.assertTrue(self.spawned[-1].killed)
+        self.assertFalse(self.spawned[-1].terminated)
+
+    def test_stop_without_a_record_is_already_stopped(self):
+        self.assertEqual("ALREADY_STOPPED", self.supervisor.stop(SERVER_ID, force=False)["result_code"])
+
+    def test_status_exposes_the_exit_code_of_a_finished_process(self):
+        self._start()
+        self.spawned[-1].returncode = 3
+
+        self.assertEqual(("exited", 3), self.supervisor.status(SERVER_ID))
+
+    def test_console_writes_one_line_to_the_process_stdin(self):
+        self._start()
+
+        self.supervisor.console(SERVER_ID, "list")
+
+        self.assertTrue(self.spawned[-1].stdin.getvalue().endswith(b"list\n"))
+        with self.assertRaisesRegex(agent_module.process_runtime.ProcessError, "console command is invalid"):
+            self.supervisor.console(SERVER_ID, "say hi\nop me")
+
+    def test_console_requires_a_running_process(self):
+        with self.assertRaisesRegex(agent_module.process_runtime.ProcessError, "not running"):
+            self.supervisor.console(SERVER_ID, "list")
+
+    def test_logs_return_only_new_lines_and_advance_the_cursor(self):
+        self._start()
+        log_path = Path(self.supervisor.record(SERVER_ID)["log"])
+        with log_path.open("a", encoding="utf-8") as log_file:
+            log_file.write("[Server thread/INFO]: ready\n[Server thread/INFO]: joined\n")
+
+        first = self.supervisor.logs(SERVER_ID)
+        self.assertEqual(["[Server thread/INFO]: ready", "[Server thread/INFO]: joined"],
+                         [entry["text"] for entry in first])
+        self.assertEqual([], self.supervisor.logs(SERVER_ID, first[-1]["ts"]))
+        with log_path.open("a", encoding="utf-8") as log_file:
+            log_file.write("[Server thread/INFO]: chat\n")
+        self.assertEqual(["[Server thread/INFO]: chat"],
+                         [entry["text"] for entry in self.supervisor.logs(SERVER_ID, first[-1]["ts"])])
+
+    def test_partial_log_lines_wait_for_the_next_tick(self):
+        self._start()
+        log_path = Path(self.supervisor.record(SERVER_ID)["log"])
+        with log_path.open("a", encoding="utf-8") as log_file:
+            log_file.write("[Server thread/INFO]: half")
+
+        self.assertEqual([], self.supervisor.logs(SERVER_ID))
+
+    def test_agent_start_routes_a_process_payload_to_the_supervisor(self):
+        result = self.runtime.execute("start", {"server_id": SERVER_ID, "process": self._spec()})
+
+        self.assertEqual("STARTED", result["result_code"])
+        self.assertEqual([], self.runtime.runner.calls, "En process-nod ska inte anropa docker")
+
+    def test_agent_console_and_stop_route_to_the_process_backend(self):
+        self.runtime.execute("start", {"server_id": SERVER_ID, "process": self._spec()})
+
+        self.runtime.execute("console", {"server_id": SERVER_ID, "command": "list"})
+        self.assertTrue(self.spawned[-1].stdin.getvalue().endswith(b"list\n"))
+
+        self.runtime.execute("stop", {"server_id": SERVER_ID, "force": False})
+        self.assertTrue(self.spawned[-1].stdin.getvalue().endswith(b"stop\n"))
+        self.assertEqual(("exited", 0), self.runtime.processes.status(SERVER_ID))
+        self.assertEqual([], self.runtime.runner.calls)
+
+    def test_agent_console_needs_a_running_process(self):
+        with self.assertRaisesRegex(agent_module.AgentError, "not running"):
+            self.runtime.execute("console", {"server_id": SERVER_ID, "command": "list"})
+
+    def _agent(self):
+        runtime = DockerRuntime(self._config(), FakeDocker([]))
+        runtime.processes = self.supervisor
+        agent = RuntimeNodeAgent(self._config(), runtime=runtime, store=agent_module.StateStore(self.config.state_dir))
+        agent.state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 1}
+        return agent
+
+    def test_report_marks_a_running_process_online_with_its_memory_limit(self):
+        self._start()
+
+        report = self._agent()._server_report(SERVER_ID, 5, None, None)
+
+        self.assertEqual("ONLINE", report["status"])
+        self.assertEqual(2048, report["memory_limit_mb"])
+        self.assertIsNone(report["cpu_percent"])
+        self.assertIsNotNone(report["uptime_seconds"])
+
+    def test_report_marks_a_nonzero_exit_as_crashed_and_zero_as_offline(self):
+        self._start()
+        agent = self._agent()
+        self.spawned[-1].returncode = 2
+        self.assertEqual("CRASHED", agent._server_report(SERVER_ID, 6, None, None)["status"])
+
+        self._start()
+        self.spawned[-1].returncode = 0
+        self.assertEqual("OFFLINE", agent._server_report(SERVER_ID, 7, None, None)["status"])
+
+    def test_report_of_an_intentionally_stopped_process_is_offline(self):
+        self._start()
+        self.supervisor.stop(SERVER_ID, force=False)
+
+        report = self._agent()._server_report(SERVER_ID, 8, None, None)
+
+        self.assertEqual("OFFLINE", report["status"])
+
+    def test_java_binary_table_parses_and_rejects_bad_configuration(self):
+        self.assertEqual({17: "/jvm/17/bin/java", 21: "/jvm/21/bin/java"},
+                         agent_module._parse_java_binaries("17=/jvm/17/bin/java, 21=/jvm/21/bin/java"))
+        self.assertEqual({}, agent_module._parse_java_binaries(""))
+        for raw in ("21", "java=/bin/java", "21=relative/java", "0=/bin/java", "99=/bin/java,101=/bin/java"):
+            with self.assertRaises(agent_module.AgentError):
+                agent_module._parse_java_binaries(raw)
 
 if __name__ == "__main__":
     unittest.main()

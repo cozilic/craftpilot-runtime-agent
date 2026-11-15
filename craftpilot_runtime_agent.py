@@ -23,10 +23,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import file_tree_index
 import migration_transfer
+import process_runtime
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +100,9 @@ class Config:
     docker_timeout_seconds: int = 45
     docker_data_root: str | None = None
     data_gid: int = 33
+    # Java-binär per huvudversion (CRAFTPILOT_JAVA_BINARIES). En process-nod
+    # kör den JRE mastern valde, aldrig den som råkade ligga först i PATH.
+    java_binaries: dict[int, str] = field(default_factory=dict)
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -116,6 +120,7 @@ class Config:
         data_gid = _bounded_int("CRAFTPILOT_SERVER_DATA_GID", 33, 0, 2**31 - 1)
         configured_images = os.environ.get("CRAFTPILOT_ALLOWED_IMAGES", "")
         images = frozenset(item.strip() for item in configured_images.split(",") if item.strip()) or DEFAULT_IMAGES
+        java_binaries = _parse_java_binaries(os.environ.get("CRAFTPILOT_JAVA_BINARIES", ""))
         network = os.environ.get("CRAFTPILOT_DOCKER_NETWORK", "craftpilot-servers")
         poll_seconds = _bounded_int("CRAFTPILOT_POLL_SECONDS", 5, 2, 120)
         stop_grace = _bounded_int("CRAFTPILOT_STOP_GRACE_SECONDS", 30, 0, 45)
@@ -131,6 +136,7 @@ class Config:
             master, node_id, token, state_dir, data_root, images, network, poll_seconds, stop_grace,
             docker_data_root=os.environ.get("CRAFTPILOT_DOCKER_SERVER_DATA_ROOT") or None,
             data_gid=data_gid,
+            java_binaries=java_binaries,
         )
 
 
@@ -142,6 +148,34 @@ def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
     if not minimum <= value <= maximum:
         raise AgentError(f"{name} must be between {minimum} and {maximum}")
     return value
+
+
+def _parse_java_binaries(raw: str) -> dict[int, str]:
+    """CRAFTPILOT_JAVA_BINARIES: "17=/usr/lib/jvm/java-17/bin/java,21=/opt/jdk-21/bin/java".
+
+    Operatören pekar ut vilken JRE som hör till varje huvudversion. Utan
+    posten för en version vägrar agenten starta en server som kräver den —
+    det är bättre än att köra fel java och krascha i
+    UnsupportedClassVersionError.
+    """
+    binaries: dict[int, str] = {}
+    for item in (part.strip() for part in raw.split(",")):
+        if not item:
+            continue
+        major, separator, executable = item.partition("=")
+        major = major.strip()
+        executable = executable.strip()
+        if not separator or not major.isdigit() or not executable:
+            raise AgentError("CRAFTPILOT_JAVA_BINARIES must look like 21=/path/to/java")
+        version = int(major)
+        if not 1 <= version <= 99:
+            raise AgentError("CRAFTPILOT_JAVA_BINARIES has an invalid Java major version")
+        if "\0" in executable or "\n" in executable:
+            raise AgentError("CRAFTPILOT_JAVA_BINARIES paths must not contain control characters")
+        if not (executable.startswith("/") or os.path.isabs(executable)):
+            raise AgentError("CRAFTPILOT_JAVA_BINARIES paths must be absolute")
+        binaries[version] = executable
+    return binaries
 
 
 def _prepare_shared_server_directory(path: Path, group_id: int) -> None:
@@ -171,6 +205,9 @@ class DockerRuntime:
             raise AgentError("CRAFTPILOT_AGENT_CONTAINER_NAME is invalid")
         self._opener = urllib.request.build_opener(_NoRedirectHandler())
         self.file_tree_index: file_tree_index.FileTreeIndex | None = None
+        # Process-noder (runtime_kind=process) äger sina servrar som lokala
+        # java-processer; Docker-vägen används bara när ingen post finns.
+        self.processes = process_runtime.ProcessSupervisor(config)
 
     def execute(self, command_type: str, payload: dict[str, Any], credential: str | None = None,
                 command_id: str | None = None) -> dict[str, Any]:
@@ -183,6 +220,14 @@ class DockerRuntime:
         if command_type == "snapshot":
             return self._stage_snapshot(server_id, payload, credential, command_id)
         if command_type == "start":
+            process = payload.get("process")
+            if process is not None:
+                if not isinstance(process, dict):
+                    raise AgentError("process specification is invalid")
+                try:
+                    return self.processes.start(server_id, process, self._server_data_path(server_id))
+                except process_runtime.ProcessError as exc:
+                    raise AgentError(str(exc)) from exc
             container = payload.get("container")
             if not isinstance(container, dict) or container.get("name") != expected_name:
                 raise AgentError("container specification does not match the server id")
@@ -191,9 +236,23 @@ class DockerRuntime:
             force = payload.get("force", False)
             if not isinstance(force, bool):
                 raise AgentError("stop force flag must be a boolean")
+            if self.processes.is_process_server(server_id):
+                try:
+                    return self.processes.stop(server_id, force)
+                except process_runtime.ProcessError as exc:
+                    raise AgentError(str(exc)) from exc
             return self._stop(server_id, expected_name, force)
         if command_type == "console":
-            return self._console(server_id, expected_name, payload.get("command"))
+            command = payload.get("command")
+            if self.processes.is_process_server(server_id):
+                try:
+                    self.processes.console(server_id, command)
+                except process_runtime.ProcessError as exc:
+                    raise AgentError(str(exc)) from exc
+                LOGGER.info("server_process_console_command_sent server_id=%s", server_id)
+                return {"success": True, "result_code": "CONSOLE_EXECUTED",
+                        "message": hashlib.sha256(command.encode("utf-8")).hexdigest()}
+            return self._console(server_id, expected_name, command)
         if command_type == "file_list":
             return {"success": True, "result_code": "FILE_LISTED",
                     "result": self._list_server_files(server_id, payload.get("path"))}
@@ -1340,6 +1399,12 @@ class DockerRuntime:
         entries.sort(key=lambda entry: (entry[0], entry[1]))
         return [entry[2] for entry in entries[-LOG_WINDOW:]]
 
+    def _logs_for_server(self, server_id: str, name: str, since: str | None = None) -> list[dict[str, str]]:
+        """Nya konsolrader för en server, oavsett runtime-typ."""
+        if self.processes.is_process_server(server_id):
+            return self.processes.logs(server_id, since)
+        return self._container_logs(name, since)
+
     def _container_id(self, name: str) -> str:
         value = self._inspect(name, "{{.Id}}")
         if value is None or not DOCKER_ID_RE.fullmatch(value):
@@ -1963,8 +2028,8 @@ class RuntimeNodeAgent:
             if cursor is not None and (not isinstance(cursor, str) or not LOG_TIMESTAMP_RE.fullmatch(cursor)):
                 raise AgentError("saved runtime log cursor is invalid")
             try:
-                logs = self.runtime._container_logs(name, cursor)
-            except (DockerError, OSError, TimeoutError):
+                logs = self.runtime._logs_for_server(server_id, name, cursor)
+            except (AgentError, DockerError, process_runtime.ProcessError, OSError, TimeoutError):
                 continue
             if not logs:
                 continue
@@ -2028,6 +2093,7 @@ class RuntimeNodeAgent:
             name = self.runtime._inspect(container_id, "{{.Name}}")
             if name is not None and name.lstrip("/") == f"craftpilot-{server_id.replace('-', '')[:8]}":
                 server_ids.add(server_id.lower())
+        server_ids.update(self.runtime.processes.server_ids())
         return sorted(server_ids)
 
     def _server_report(
@@ -2039,6 +2105,8 @@ class RuntimeNodeAgent:
         name = f"craftpilot-{server_id.replace('-', '')[:8]}"
         if not CONTAINER_RE.fullmatch(name):
             return None
+        if self.runtime.processes.is_process_server(server_id):
+            return self._process_server_report(server_id, sequence, log_since, artifact_check)
         running = self.runtime._inspect(name, "{{.State.Running}}")
         if running is None:
             try:
@@ -2087,14 +2155,77 @@ class RuntimeNodeAgent:
             started_at = ""
         disk_used_mb = self.runtime._server_disk_used_mb(server_id)
         try:
-            logs = self.runtime._container_logs(name, log_since)
-        except (DockerError, OSError, TimeoutError):
+            logs = self.runtime._logs_for_server(server_id, name, log_since)
+        except (AgentError, DockerError, process_runtime.ProcessError, OSError, TimeoutError):
             logs = []
         return {"sequence": sequence, "server_id": server_id, "status": status, "cpu_percent": cpu_percent,
                 "memory_used_mb": memory_used_mb, "memory_limit_mb": memory_limit_mb,
                 "uptime_seconds": self._uptime_seconds(started_at) if running == "true" else None,
                 "players_online": None, "players_max": None, "disk_used_mb": disk_used_mb,
                 "artifact_present": self._artifact_present(server_id, artifact_check), "logs": logs}
+
+    def _process_server_report(
+        self, server_id: str, sequence: int, log_since: str | None,
+        artifact_check: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Samma rapportform som Docker-vägen, men ur process-tillståndet.
+
+        En process-nod har ingen container att fråga: status kommer från
+        pid:en och exit-koden, mätvärden finns inte (None) och loggraderna
+        läses ur processens loggfil. En process som avslutats med exitkod 0
+        (eller utan känd kod efter en agentomstart) är OFFLINE; en annan kod
+        är CRASHED — samma regel som för containrar.
+        """
+        status, exit_code = self.runtime.processes.status(server_id)
+        record = self.runtime.processes.record(server_id) or {}
+        if status == "missing":
+            try:
+                self.runtime._server_data_path(server_id)
+            except (AgentError, OSError):
+                return None
+            return {
+                "sequence": sequence, "server_id": server_id, "status": "OFFLINE",
+                "cpu_percent": None, "memory_used_mb": None, "memory_limit_mb": None,
+                "uptime_seconds": None, "players_online": None, "players_max": None,
+                "disk_used_mb": self.runtime._server_disk_used_mb(server_id),
+                "artifact_present": self._artifact_present(server_id, artifact_check), "logs": [],
+            }
+        running = status == "running"
+        intentional_stops = self.state.get("intentional_stops", {}) if self.state is not None else {}
+        if not isinstance(intentional_stops, dict) or any(
+            not isinstance(key, str) or not UUID_RE.fullmatch(key)
+            or not isinstance(value, str) or not UUID_RE.fullmatch(value)
+            for key, value in intentional_stops.items()
+        ):
+            raise AgentError("saved intentional stop state is invalid")
+        if running and server_id in intentional_stops:
+            intentional_stops.pop(server_id)
+            if self.state is not None:
+                self.store.save(self.state)
+        if running:
+            reported_status = "ONLINE"
+        elif server_id in intentional_stops or exit_code in (None, 0):
+            reported_status = "OFFLINE"
+        else:
+            reported_status = "CRASHED"
+        name = f"craftpilot-{server_id.replace('-', '')[:8]}"
+        logs: list[dict[str, str]] = []
+        if running:
+            try:
+                logs = self.runtime._logs_for_server(server_id, name, log_since)
+            except (AgentError, DockerError, process_runtime.ProcessError, OSError, TimeoutError):
+                logs = []
+        memory_limit = record.get("memory_limit_mb")
+        started_at = record.get("started_at")
+        return {
+            "sequence": sequence, "server_id": server_id, "status": reported_status,
+            "cpu_percent": None, "memory_used_mb": None,
+            "memory_limit_mb": memory_limit if isinstance(memory_limit, int) else None,
+            "uptime_seconds": self._uptime_seconds(started_at) if running and isinstance(started_at, str) else None,
+            "players_online": None, "players_max": None,
+            "disk_used_mb": self.runtime._server_disk_used_mb(server_id),
+            "artifact_present": self._artifact_present(server_id, artifact_check), "logs": logs,
+        }
 
     def _artifact_present(self, server_id: str, check: dict[str, Any] | None) -> bool | None:
         if check is None:
