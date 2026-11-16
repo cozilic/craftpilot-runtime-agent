@@ -226,6 +226,31 @@ class ProcessSupervisor:
         LOGGER.info("server_process_stopped server_id=%s method=%s", server_id, "force" if force else "graceful")
         return {"success": True, "result_code": "STOPPED"}
 
+    def delete(self, server_id: str) -> None:
+        """Stoppa servern om den kör och glöm bort process, logg och cursor.
+
+        Anropas när mastern tar bort servern. Idempotent: en server som redan
+        är borta ger inget fel. Loggfilen tas bort efter posten så en senare
+        rapport inte kan peka på en halvstädad server.
+        """
+        if self.is_process_server(server_id):
+            status, _exit_code = self.status(server_id)
+            if status == "running":
+                self.stop(server_id, force=True)
+        state = self._load()
+        record = state["servers"].pop(server_id, None)
+        state["cursors"].pop(server_id, None)
+        self._save(state)
+        self._handles.pop(server_id, None)
+        log_path = record.get("log") if isinstance(record, dict) else None
+        if isinstance(log_path, str):
+            try:
+                Path(log_path).unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise ProcessError("process log could not be removed") from exc
+
     def console(self, server_id: str, command: Any) -> None:
         if (not isinstance(command, str) or not command or len(command) > 16384
                 or "\x00" in command or "\n" in command or "\r" in command):

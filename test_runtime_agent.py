@@ -89,6 +89,8 @@ class FakeDocker:
             return SimpleNamespace(returncode=0, stdout=CONTAINER_NAME, stderr="")
         if args[:2] == ["docker", "stop"] or args[:2] == ["docker", "kill"]:
             return SimpleNamespace(returncode=0, stdout=CONTAINER_NAME, stderr="")
+        if args[:3] == ["docker", "rm", "--force"]:
+            return SimpleNamespace(returncode=0, stdout=args[-1] + "\n", stderr="")
         if args[:2] == ["docker", "cp"] and args[-1] == "-":
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         raise AssertionError(f"Unexpected Docker call: {args}")
@@ -2086,6 +2088,125 @@ class PlatformSupportTests(unittest.TestCase):
         with self.assertLogs("craftpilot.runtime_agent", level="WARNING"):
             self.assertEqual([SERVER_ID], agent._assigned_server_ids())
         self.assertFalse(agent._docker_cli, "ett trasigt docker ska inte frågas varje poll")
+
+
+class CancelAndDeleteTests(unittest.TestCase):
+    """Masterns avbryt- och borttagningskommandon på en nod."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.config = make_config(self.root)
+        self.config.data_root.mkdir()
+        self.server_root = self.config.data_root / SERVER_ID
+        self.server_root.mkdir()
+        (self.server_root / "world.dat").write_text("world")
+        self.java = self.root / "jdk21" / "bin" / "java"
+        self.java.parent.mkdir(parents=True)
+        self.java.write_text("#!/bin/sh\n")
+        self.spawned = []
+        self.runtime = DockerRuntime(self.config, FakeDocker(["true", "false"]))
+        self.supervisor = self._supervisor()
+
+    def _config(self):
+        return Config(
+            master_url=self.config.master_url,
+            node_id=self.config.node_id,
+            registration_token=None,
+            state_dir=self.config.state_dir,
+            data_root=self.config.data_root,
+            images=self.config.images,
+            java_binaries={21: str(self.java)},
+        )
+
+    def _supervisor(self):
+        def popen(argv, **options):
+            process = FakeProcess(argv, **options)
+            self.spawned.append(process)
+            return process
+
+        supervisor = agent_module.process_runtime.ProcessSupervisor(
+            self._config(), popen=popen, sleep=lambda _seconds: None,
+        )
+        supervisor._alive = lambda pid: isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+        self.runtime.processes = supervisor
+        return supervisor
+
+    def _start_process(self):
+        self.supervisor.start(SERVER_ID, {
+            "java_major": 21, "native_binary": False,
+            "command": ["java", "-jar", "server.jar", "nogui"],
+            "port": 25571, "memory_mb": 2048, "cpus": 2.0,
+        }, self.server_root)
+
+    def test_cancel_start_kills_a_hanging_process(self):
+        self._start_process()
+
+        result = self.runtime.execute("cancel_start", {"server_id": SERVER_ID})
+
+        self.assertEqual("START_CANCELLED", result["result_code"])
+        self.assertTrue(self.spawned[-1].killed)
+        self.assertEqual(("exited", -9), self.supervisor.status(SERVER_ID))
+
+    def test_cancel_start_without_a_container_is_already_stopped(self):
+        self.runtime.runner = FakeDocker(["__missing__"])
+
+        result = self.runtime.execute("cancel_start", {"server_id": SERVER_ID})
+
+        self.assertEqual("ALREADY_STOPPED", result["result_code"])
+
+    def test_cancel_start_kills_a_started_container(self):
+        labels = json.dumps({"craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID})
+        self.runtime.runner = FakeDocker(["true", labels, "false"])
+
+        result = self.runtime.execute("cancel_start", {"server_id": SERVER_ID})
+
+        self.assertEqual("START_CANCELLED", result["result_code"])
+        self.assertIn(["docker", "kill", "--signal=KILL", CONTAINER_NAME], self.runtime.runner.calls)
+
+    def test_delete_server_removes_data_process_record_and_log(self):
+        self._start_process()
+        log_path = Path(self.supervisor.record(SERVER_ID)["log"])
+        self.assertTrue(log_path.exists())
+
+        result = self.runtime.execute("delete_server", {"server_id": SERVER_ID})
+
+        self.assertEqual("SERVER_DELETED", result["result_code"])
+        self.assertFalse(self.server_root.exists())
+        self.assertFalse(self.supervisor.is_process_server(SERVER_ID))
+        self.assertFalse(log_path.exists())
+
+    def test_delete_server_is_idempotent_without_any_runtime_state(self):
+        shutil.rmtree(self.server_root)
+
+        result = self.runtime.execute("delete_server", {"server_id": SERVER_ID})
+
+        self.assertEqual("SERVER_DELETED", result["result_code"])
+        self.assertFalse(self.server_root.exists())
+
+    def test_delete_server_removes_the_container_and_the_data(self):
+        runtime = DockerRuntime(self.config, FakeDocker([]))
+
+        result = runtime.execute("delete_server", {"server_id": SERVER_ID})
+
+        self.assertEqual("SERVER_DELETED", result["result_code"])
+        self.assertIn(["docker", "rm", "--force", CONTAINER_NAME], runtime.runner.calls)
+        self.assertFalse(self.server_root.exists())
+
+    def test_delete_server_refuses_a_symlinked_data_directory(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "keep.txt").write_text("be careful")
+        shutil.rmtree(self.server_root)
+        try:
+            self.server_root.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("Creating a symlink requires Windows developer mode or elevated privileges")
+
+        with self.assertRaisesRegex(agent_module.AgentError, "symlink"):
+            self.runtime.execute("delete_server", {"server_id": SERVER_ID})
+        self.assertTrue((outside / "keep.txt").exists())
 
 if __name__ == "__main__":
     unittest.main()

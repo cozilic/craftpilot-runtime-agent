@@ -266,6 +266,10 @@ class DockerRuntime:
                 except process_runtime.ProcessError as exc:
                     raise AgentError(str(exc)) from exc
             return self._stop(server_id, expected_name, force)
+        if command_type == "cancel_start":
+            return self._cancel_start(server_id, expected_name)
+        if command_type == "delete_server":
+            return self._delete_server(server_id, expected_name)
         if command_type == "console":
             command = payload.get("command")
             if self.processes.is_process_server(server_id):
@@ -1422,6 +1426,77 @@ class DockerRuntime:
                 entries.append((parsed_timestamp, stream_index, {"ts": timestamp, "text": text[-8192:]}))
         entries.sort(key=lambda entry: (entry[0], entry[1]))
         return [entry[2] for entry in entries[-LOG_WINDOW:]]
+
+    def _cancel_start(self, server_id: str, name: str) -> dict[str, Any]:
+        """Avbryt en start som hänger: stoppa processen eller containern hårt.
+
+        Mastern sätter CANCELLED först när agenten bekräftar, så statusen
+        speglar alltid vad noden faktiskt gjorde. Idempotent: en server som
+        redan är stoppad svarar ALREADY_STOPPED och mastern går till CANCELLED
+        ändå.
+        """
+        if self.processes.is_process_server(server_id):
+            status, _exit_code = self.processes.status(server_id)
+            if status != "running":
+                return {"success": True, "result_code": "ALREADY_STOPPED"}
+            try:
+                self.processes.stop(server_id, force=True)
+            except process_runtime.ProcessError as exc:
+                raise AgentError(str(exc)) from exc
+            LOGGER.info("server_process_start_cancelled server_id=%s", server_id)
+            return {"success": True, "result_code": "START_CANCELLED"}
+        try:
+            result = self._stop(server_id, name, force=True)
+        except DockerError:
+            # Ingen container att avbryta (t.ex. den skapades aldrig).
+            return {"success": True, "result_code": "ALREADY_STOPPED"}
+        if result.get("result_code") == "ALREADY_STOPPED":
+            return result
+        LOGGER.info("server_container_start_cancelled server_id=%s", server_id)
+        return {"success": True, "result_code": "START_CANCELLED"}
+
+    def _delete_server(self, server_id: str, name: str) -> dict[str, Any]:
+        """Ta bort serverns data och runtime-spår på noden.
+
+        Ingår i serverns borttagning i mastern. Ordningen är process/container
+        först och filer sist, så en process som fortfarande skriver inte kan
+        återskapa katalogen. Idempotent: saknad container, saknad process och
+        saknad katalog är alla ett lyckat resultat.
+        """
+        if self.processes.is_process_server(server_id):
+            try:
+                self.processes.delete(server_id)
+            except process_runtime.ProcessError as exc:
+                raise AgentError(str(exc)) from exc
+        elif shutil.which("docker") is not None:
+            try:
+                self._run(["docker", "rm", "--force", name], timeout=60)
+                LOGGER.info("server_container_removed server_id=%s", server_id)
+            except (DockerError, OSError):
+                LOGGER.info("server_container_remove_noop server_id=%s", server_id)
+        directory = self._deletable_server_directory(server_id)
+        if directory is not None:
+            try:
+                shutil.rmtree(directory)
+            except OSError as exc:
+                raise AgentError("server data could not be removed") from exc
+            LOGGER.info("server_data_deleted server_id=%s", server_id)
+        return {"success": True, "result_code": "SERVER_DELETED"}
+
+    def _deletable_server_directory(self, server_id: str) -> Path | None:
+        """Serverns katalog, kontrollerad mot data-roten (AGENTS §6)."""
+        root = self.config.data_root.resolve(strict=True)
+        candidate = root / server_id
+        if candidate.is_symlink():
+            raise AgentError("server data path is a symlink")
+        if not candidate.exists():
+            return None
+        if not candidate.is_dir():
+            raise AgentError("server data path is not a directory")
+        resolved = candidate.resolve(strict=True)
+        if resolved.parent != root or resolved == root:
+            raise AgentError("server data path escapes the configured root")
+        return resolved
 
     def _logs_for_server(self, server_id: str, name: str, since: str | None = None) -> list[dict[str, str]]:
         """Nya konsolrader för en server, oavsett runtime-typ."""
