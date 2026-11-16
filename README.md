@@ -240,6 +240,8 @@ A node registered with `runtime_kind=process` runs its servers as local java pro
 
 Stop uses the server's own `stop` console command and falls back to SIGTERM; force stop uses SIGKILL. Process state and the last exit code live in `processes.json` in the agent state directory, so a crashed server reports `CRASHED` with its code, a clean or intentional stop reports `OFFLINE`, and console lines are tailed from `process-logs/<server-id>.log` with the same dedupe cursor as containers. CPU and memory figures are not collected for process servers; the memory limit is reported as configured.
 
+`cancel_start` aborts a start that the master is still showing as `STARTING`: it stops the process with SIGKILL (containers get `docker kill --signal=KILL` and `docker rm --force`) and answers `START_CANCELLED`, or `ALREADY_STOPPED` when nothing was running any more. `delete_server` stops a running process or container, removes the container, deletes the server's data directory and finally drops its process record and log file. The data directory is resolved under `CRAFTPILOT_SERVER_DATA_ROOT`; the root itself, symlinked directories and paths that escape the root are refused, and deleting a server that is already gone still answers `SERVER_DELETED` so the master's retry does not get stuck.
+
 ## Operations and safety
 
 - The agent accepts only fixed `snapshot`, `start`, `stop`, and `console` operations. Console input is sent over authenticated RCON; it is never interpolated into a host-shell command.
