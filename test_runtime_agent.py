@@ -258,9 +258,43 @@ class EnrollmentTests(unittest.TestCase):
         self.assertTrue(self.agent.ensure_registered())
         self.assertFalse(self.agent.credential_revoked)
         self.assertEqual("n" * 64, self.agent.state["credential"])
-        self.assertEqual([("POST", f"/api/runtime/nodes/{node_id}/register", {"registration_token": token})], calls)
+        self.assertEqual([("POST", f"/api/runtime/nodes/{node_id}/register",
+                            {"registration_token": token, "agent_version": agent_module.AGENT_VERSION})], calls)
         self.assertIsNone(self.agent.config.registration_token)
         self.assertNotIn("credential_revoked", self.agent.store.load())
+
+    def test_reported_agent_version_is_the_build_version(self):
+        # Bygget sätter versionen (tagg/git describe); källkörning rapporterar "dev".
+        self.assertNotEqual("local-docker", agent_module.AGENT_VERSION)
+        self.assertRegex(agent_module.AGENT_VERSION, r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
+
+    def test_enrollment_and_claims_carry_the_agent_version(self):
+        bodies = []
+        node_id = "9f4a2d91-728a-4e9e-a4a2-a580f263da67"
+
+        def request(method, path, body, credential=False):
+            bodies.append((path, body))
+            if path == "/api/runtime/enrollments":
+                return {"request_id": "9f4a2d91-728a-4e9e-a4a2-a580f263da66", "request_secret": "s" * 64}
+            raise AssertionError(path)
+
+        self.agent._request = request
+        self.agent.ensure_registered()
+        self.assertEqual(agent_module.AGENT_VERSION, bodies[0][1]["agent_version"])
+
+        claim_bodies = []
+
+        def claim_request(method, path, body, credential=False):
+            claim_bodies.append(body)
+            return {
+                "command": None,
+                "node_settings": {"name": "Node", "max_servers": 4, "poll_interval_seconds": 11},
+            }
+
+        self.agent.state = {"node_id": node_id, "credential": "c" * 64, "sequence": 1}
+        self.agent._request = claim_request
+        self.agent._claim_and_execute()
+        self.assertEqual(agent_module.AGENT_VERSION, claim_bodies[-1]["agent_version"])
 
     def test_approved_replacement_node_id_wins_over_a_stale_configured_id(self):
         # Ersättningsenrollment ger ett NYTT node-id medan miljön pinnar det

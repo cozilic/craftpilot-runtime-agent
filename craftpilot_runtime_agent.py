@@ -31,6 +31,11 @@ import process_runtime
 from pathlib import Path
 from typing import Any
 
+try:  # Sätts av bygget (craftpilot-agent.spec); källkörning rapporterar "dev".
+    from _build_version import BUILD_VERSION as AGENT_VERSION
+except ImportError:  # pragma: no cover - alltid satt i den byggda exe:n
+    AGENT_VERSION = "dev"
+
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 CONTAINER_RE = re.compile(r"^craftpilot-[0-9a-f]{8}$")
 DOCKER_ID_RE = re.compile(r"^[0-9a-f]{12,64}$", re.I)
@@ -1632,7 +1637,8 @@ class RuntimeNodeAgent:
             token = self.config.registration_token
             if not token or not 32 <= len(token) <= 128:
                 raise AgentError("registration token is required for first enrollment")
-            result = self._request("POST", f"/api/runtime/nodes/{self.config.node_id}/register", {"registration_token": token})
+            result = self._request("POST", f"/api/runtime/nodes/{self.config.node_id}/register",
+                                   {"registration_token": token, "agent_version": AGENT_VERSION})
             credential = result.get("credential")
             if result.get("node_id") != self.config.node_id or not isinstance(credential, str) or not re.fullmatch(r"[A-Za-z0-9]{64}", credential):
                 raise AgentError("master returned an invalid registration response")
@@ -1664,7 +1670,7 @@ class RuntimeNodeAgent:
         if isinstance(token, str) and 32 <= len(token) <= 128:
             try:
                 result = self._request("POST", f"/api/runtime/nodes/{node_id}/register",
-                                       {"registration_token": token})
+                                       {"registration_token": token, "agent_version": AGENT_VERSION})
             except HttpStatusError as exc:
                 if exc.status != 401:
                     raise
@@ -1722,7 +1728,7 @@ class RuntimeNodeAgent:
 
     def _post_enrollment_request(self) -> tuple[str, str]:
         result = self._request("POST", "/api/runtime/enrollments", {
-            "hostname": socket.gethostname()[:255] or "craftpilot-agent", "agent_version": "local-docker",
+            "hostname": socket.gethostname()[:255] or "craftpilot-agent", "agent_version": AGENT_VERSION,
         })
         request_id, request_secret = result.get("request_id"), result.get("request_secret")
         if not isinstance(request_id, str) or not UUID_RE.fullmatch(request_id) or not isinstance(request_secret, str) or not re.fullmatch(r"[A-Za-z0-9]{64}", request_secret):
@@ -1887,7 +1893,8 @@ class RuntimeNodeAgent:
                 self.poll_enrollment_once()
                 return "not-ready"
         sequence = self._bump_sequence()
-        claim = self._request("POST", f"/api/runtime/nodes/{self.config.node_id}/commands/claim", {"sequence": sequence}, credential=True)
+        claim = self._request("POST", f"/api/runtime/nodes/{self.config.node_id}/commands/claim",
+                              {"sequence": sequence, "agent_version": AGENT_VERSION}, credential=True)
         self._apply_node_settings(claim.get("node_settings"))
         command = claim.get("command")
         if command is None:
