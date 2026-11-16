@@ -264,6 +264,8 @@ git pull
 docker compose up -d --build
 ```
 
+Images published from a `v*` tag are tagged `ghcr.io/cozilic/craftpilot-runtime-agent:<tag>` (and `latest`) and report that tag's version without the leading `v` to the master at enrollment, registration and on every claim, so the node list shows which agent actually runs. A build without the tag, such as `docker compose up -d --build`, reports `dev`.
+
 On Windows, run these commands inside the selected WSL distribution in `~/craftpilot-runtime-agent`; rerunning `setup-windows.ps1` from the Windows checkout also syncs and rebuilds the WSL copy.
 
 Inspect agent output with:
