@@ -91,7 +91,20 @@ docker compose logs -f runtime-agent
 
 Do not run the Linux `setup.sh` from PowerShell or execute the Compose project from a Windows-mounted `/mnt/c` checkout; Linux socket and sibling-container data mounts require the WSL filesystem and Docker integration.
 
-### Force setup past a preflight failure (`--force`)
+### Windows executable (process nodes without Docker)
+
+A node registered as `runtime_kind=process` does not need Docker at all, and the agent is also published as a standalone Windows executable. `.github/workflows/build-windows-exe.yml` runs the test suite, builds `craftpilot-agent.exe` with PyInstaller and uploads it as the `craftpilot-agent-windows` artifact on every `v*` tag, or on demand through *Run workflow*.
+
+Download and unpack the artifact, then configure the node with environment variables and start it:
+
+```powershell
+$env:CRAFTPILOT_MASTER_URL = 'https://craftpilot.se'
+$env:CRAFTPILOT_JAVA_BINARIES = '21=C:\Java\jdk-21\bin\java.exe'
+.\craftpilot-agent.exe
+```
+
+State and server data default to `%LOCALAPPDATA%\CraftPilotRuntimeAgent\agent` and `%LOCALAPPDATA%\CraftPilotRuntimeAgent\servers`; override them with `CRAFTPILOT_AGENT_STATE_DIR` and `CRAFTPILOT_SERVER_DATA_ROOT`. The executable manages the servers the master sends as process payloads and needs no Docker CLI: when none is installed it skips container discovery instead of failing every report. Only one instance can run per state directory — a second one exits with the state-lock error, so stop the running agent before starting a new build.
+
 
 If a preflight check blocks setup on a host you still want to use, every setup script can continue anyway:
 
@@ -203,6 +216,8 @@ The checked-in `.env.example` provides safe defaults, including `CRAFTPILOT_MAST
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CRAFTPILOT_MASTER_URL` | `https://craftpilot.se` | CraftPilot master origin. |
+| `CRAFTPILOT_AGENT_STATE_DIR` | Linux: `/var/lib/craftpilot-agent`; Windows executable: `%LOCALAPPDATA%\CraftPilotRuntimeAgent\agent` | Agent state, process records and the single-instance lock. |
+| `CRAFTPILOT_SERVER_DATA_ROOT` | Linux: `/srv/craftpilot/servers`; Windows executable: `%LOCALAPPDATA%\CraftPilotRuntimeAgent\servers` | Root of the per-server data directories. |
 | `CRAFTPILOT_SERVER_DATA_HOST_PATH` | Linux: `/srv/craftpilot/servers`; Desktop defaults are set by the platform setup | Directory mounted into the agent. Keep it dedicated to server data. |
 | `CRAFTPILOT_DOCKER_SERVER_DATA_ROOT` | Same as `CRAFTPILOT_SERVER_DATA_HOST_PATH` | Path that the Docker daemon uses as the source for Minecraft container mounts; set separately only when Docker’s daemon path differs. |
 | `DOCKER_GID` | Detected by setup | Numeric supplementary group for the Docker socket. Docker access is privileged. |

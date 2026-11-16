@@ -1,0 +1,64 @@
+name: Build Windows agent executable
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows executable
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install cryptography==46.0.5 pyinstaller==6.16.0
+
+      # Samma svit som image-jobbet kör, men på Windows: den fångar
+      # plattformsgrenarna (state-katalog, lås, Docker-fri upptäckt).
+      - name: Run agent tests
+        run: python -m unittest discover -s . -p "test_*.py"
+
+      - name: Build the standalone executable
+        run: pyinstaller --noconfirm craftpilot-agent.spec
+
+      # Utan konfiguration ska exe:n avvisa miljön med exitkod 1. Det bevisar
+      # att bundlen startar och att cryptography-modulerna följde med.
+      - name: Smoke-test the executable
+        shell: pwsh
+        run: |
+          $env:CRAFTPILOT_MASTER_URL = ''
+          $output = & .\dist\craftpilot-agent.exe 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          if ($code -ne 1) { throw "expected exit code 1, got $code. Output: $output" }
+          if ($output -notmatch 'CRAFTPILOT_MASTER_URL must use HTTPS') {
+            throw "unexpected executable output: $output"
+          }
+
+      - name: Write checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 .\dist\craftpilot-agent.exe).Hash.ToLower()
+          "$hash  craftpilot-agent.exe" | Set-Content -Encoding ascii .\dist\craftpilot-agent.exe.sha256
+
+      - name: Upload the executable
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: craftpilot-agent-windows
+          path: |
+            dist/craftpilot-agent.exe
+            dist/craftpilot-agent.exe.sha256
+          if-no-files-found: error

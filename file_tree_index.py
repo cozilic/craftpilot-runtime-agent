@@ -597,12 +597,15 @@ class FileTreeIndex:
                 return
             fd, temp_name = tempfile.mkstemp(prefix=".file-tree-", suffix=".tmp", dir=self.state_dir)
             try:
-                os.fchmod(fd, 0o600)
+                # os.fchmod finns inte på Windows före 3.13 (och behövs inte
+                # där); mkstemp skapar filen med 0600 på POSIX. Samma skydd som
+                # övriga state-skrivningar i agenten.
+                if os.name != "nt":
+                    os.fchmod(fd, 0o600)
                 with os.fdopen(fd, "wb") as output:
                     output.write(encoded)
                     output.flush()
                     os.fsync(output.fileno())
-                    os.fchmod(output.fileno(), 0o600)
                 os.replace(temp_name, self.index_path)
             finally:
                 try:
