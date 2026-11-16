@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CraftPilot Linux runtime-node agent (stdlib only)."""
+"""CraftPilot runtime-node agent for Docker nodes and process nodes."""
 
 from __future__ import annotations
 
@@ -115,8 +115,10 @@ class Config:
                 token = Path(token_file).read_text(encoding="utf-8").strip() or None
             except OSError as exc:
                 raise AgentError("could not read CRAFTPILOT_REGISTRATION_TOKEN_FILE") from exc
-        state_dir = Path(os.environ.get("CRAFTPILOT_AGENT_STATE_DIR", "/var/lib/craftpilot-agent"))
-        data_root = Path(os.environ.get("CRAFTPILOT_SERVER_DATA_ROOT", "/srv/craftpilot/servers"))
+        state_dir = Path(os.environ.get("CRAFTPILOT_AGENT_STATE_DIR")
+                         or _platform_default_directory("agent"))
+        data_root = Path(os.environ.get("CRAFTPILOT_SERVER_DATA_ROOT")
+                         or _platform_default_directory("servers"))
         data_gid = _bounded_int("CRAFTPILOT_SERVER_DATA_GID", 33, 0, 2**31 - 1)
         configured_images = os.environ.get("CRAFTPILOT_ALLOWED_IMAGES", "")
         images = frozenset(item.strip() for item in configured_images.split(",") if item.strip()) or DEFAULT_IMAGES
@@ -148,6 +150,28 @@ def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
     if not minimum <= value <= maximum:
         raise AgentError(f"{name} must be between {minimum} and {maximum}")
     return value
+
+
+def _platform_default_directory(kind: str, platform: str | None = None,
+                                environ: dict[str, str] | None = None) -> str:
+    """Standardkatalog för agenten, per plattform.
+
+    Containern och Linux-noderna har alltid använt /var/lib/... och /srv/...,
+    men en Windows-exe har inga sådana sökvägar. Där hamnar agentens state och
+    serverdatan under användarens LOCALAPPDATA i stället. Katalogen heter
+    CraftPilotRuntimeAgent och inte CraftPilot: desktop-appen har redan en
+    WebView2-profil i %LOCALAPPDATA%\\CraftPilot\\Agent, och agenten får aldrig
+    skriva i någon annans profil. platform/environ är parametrar så testerna kan
+    pröva båda utan att byta operativsystem.
+    """
+    platform = os.name if platform is None else platform
+    environ = os.environ if environ is None else environ
+    if platform == "nt":
+        base = next((environ[name] for name in ("LOCALAPPDATA", "APPDATA", "PROGRAMDATA")
+                     if environ.get(name)), None)
+        if base:
+            return str(Path(base) / "CraftPilotRuntimeAgent" / kind)
+    return {"agent": "/var/lib/craftpilot-agent", "servers": "/srv/craftpilot/servers"}[kind]
 
 
 def _parse_java_binaries(raw: str) -> dict[int, str]:
@@ -1491,6 +1515,9 @@ class RuntimeNodeAgent:
         self.credential_revoked = False
         self.poll_seconds = config.poll_seconds
         self.node_settings: dict[str, Any] = {}
+        # None = inte undersökt än; False = noden saknar Docker-CLI och ska bara
+        # rapportera sina process-servrar.
+        self._docker_cli: bool | None = None
         if isinstance(self.runtime, DockerRuntime):
             self.runtime.state_store = self.store
 
@@ -2077,9 +2104,20 @@ class RuntimeNodeAgent:
             LOGGER.info("server_report_resumed server_id=%s reason=command_received", server_id)
 
     def _assigned_server_ids(self) -> list[str]:
-        output = self.runtime._run(["docker", "ps", "--all", "--filter", "label=craftpilot.managed=1",
-                                    "--filter", "label=craftpilot.server_id", "--format", "{{.ID}}"], timeout=10)
-        server_ids: set[str] = set()
+        # Process-servrar ägs direkt av agenten och behöver ingen Docker. Saknar
+        # noden en Docker-CLI (Windows-exe utan Docker Desktop) får det inte
+        # tysta all telemetri: containerdelen hoppas över, processerna rapporteras.
+        server_ids: set[str] = set(self.runtime.processes.server_ids())
+        if not self._docker_available():
+            return sorted(server_ids)
+        try:
+            output = self.runtime._run(["docker", "ps", "--all", "--filter", "label=craftpilot.managed=1",
+                                        "--filter", "label=craftpilot.server_id", "--format", "{{.ID}}"],
+                                       timeout=10)
+        except (DockerError, OSError):
+            self._docker_cli = False
+            LOGGER.warning("docker_unavailable container_discovery_skipped")
+            return sorted(server_ids)
         for container_id in output.splitlines():
             container_id = container_id.strip()
             if not DOCKER_ID_RE.fullmatch(container_id):
@@ -2093,8 +2131,15 @@ class RuntimeNodeAgent:
             name = self.runtime._inspect(container_id, "{{.Name}}")
             if name is not None and name.lstrip("/") == f"craftpilot-{server_id.replace('-', '')[:8]}":
                 server_ids.add(server_id.lower())
-        server_ids.update(self.runtime.processes.server_ids())
         return sorted(server_ids)
+
+    def _docker_available(self) -> bool:
+        """Om noden har en Docker-CLI alls; annars rapporteras bara processer."""
+        if self._docker_cli is None:
+            self._docker_cli = shutil.which("docker") is not None
+            if not self._docker_cli:
+                LOGGER.info("docker_cli_missing running_without_containers")
+        return self._docker_cli
 
     def _server_report(
         self, server_id: str, sequence: int, log_since: str | None = None,
@@ -2329,6 +2374,9 @@ class RuntimeNodeAgent:
         byggts om och återskapats tappar det. Utan det kan noden inte nå RCON
         förrän nästa server-start kopplar in den igen.
         """
+        if not self._docker_available():
+            # En process-nod utan Docker har inget nätverk att koppla in sig i.
+            return
         connect = getattr(self.runtime, "_connect_agent_to_runtime_network", None)
         if connect is None:
             return
@@ -2440,6 +2488,22 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _lock_state_file(lock_file: Any) -> None:
+    """Ta exklusivt lås på state-katalogen: flock på POSIX, msvcrt på Windows."""
+    try:
+        if os.name == "nt":
+            import msvcrt
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            return
+        import fcntl
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except ImportError as exc:  # pragma: no cover - stdlib finns på alla mål
+        raise AgentError("this platform cannot lock the agent state directory") from exc
+    except OSError as exc:
+        raise AgentError("another agent process already holds the state lock") from exc
+
+
 def main() -> int:
     logging.basicConfig(
         level=os.environ.get("CRAFTPILOT_LOG_LEVEL", "INFO").upper(),
@@ -2452,11 +2516,7 @@ def main() -> int:
         lock_path = config.state_dir / "agent.lock"
         with lock_path.open("a", encoding="utf-8") as lock_file:
             os.chmod(lock_path, 0o600)
-            import fcntl
-            try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                raise AgentError("another agent process already holds the state lock") from exc
+            _lock_state_file(lock_file)
             signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
             LOGGER.info("runtime_agent_started node_id=%s", config.node_id or "pending_enrollment")
             agent = RuntimeNodeAgent(config)

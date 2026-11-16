@@ -2013,5 +2013,79 @@ class ProcessRuntimeTests(unittest.TestCase):
             with self.assertRaises(agent_module.AgentError):
                 agent_module._parse_java_binaries(raw)
 
+
+class PlatformSupportTests(unittest.TestCase):
+    """Windows-exe: plattformsdefaults, lås och Docker-fri telemetri."""
+
+    def _agent(self, runtime):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        config = make_config(Path(temporary.name))
+        return RuntimeNodeAgent(config, runtime=runtime, store=MemoryStateStore())
+
+    def test_platform_default_directories(self):
+        windows = {"LOCALAPPDATA": r"C:\Users\ops\AppData\Local", "PROGRAMDATA": r"C:\ProgramData"}
+
+        self.assertEqual(str(Path(windows["LOCALAPPDATA"]) / "CraftPilotRuntimeAgent" / "agent"),
+                         agent_module._platform_default_directory("agent", platform="nt", environ=windows))
+        self.assertEqual(str(Path(windows["LOCALAPPDATA"]) / "CraftPilotRuntimeAgent" / "servers"),
+                         agent_module._platform_default_directory("servers", platform="nt", environ=windows))
+        self.assertEqual("/var/lib/craftpilot-agent",
+                         agent_module._platform_default_directory("agent", platform="posix", environ={}))
+        self.assertEqual("/srv/craftpilot/servers",
+                         agent_module._platform_default_directory("servers", platform="posix", environ={}))
+
+    def test_from_env_uses_the_platform_state_and_data_directory(self):
+        environ = {
+            "CRAFTPILOT_MASTER_URL": "https://craftpilot.example",
+            "LOCALAPPDATA": r"C:\Users\ops\AppData\Local",
+        }
+        with patch.dict(os.environ, environ, clear=True):
+            config = Config.from_env()
+            expected_state = Path(agent_module._platform_default_directory("agent"))
+            expected_data = Path(agent_module._platform_default_directory("servers"))
+
+        self.assertEqual(expected_state, config.state_dir)
+        self.assertEqual(expected_data, config.data_root)
+
+    def test_state_lock_refuses_a_second_agent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lock_path = Path(directory) / "agent.lock"
+            with lock_path.open("a", encoding="utf-8") as first:
+                agent_module._lock_state_file(first)
+                with lock_path.open("a", encoding="utf-8") as second:
+                    with self.assertRaisesRegex(agent_module.AgentError, "already holds the state lock"):
+                        agent_module._lock_state_file(second)
+            with lock_path.open("a", encoding="utf-8") as released:
+                agent_module._lock_state_file(released)
+
+    def test_assignment_discovery_without_docker_reports_process_servers_only(self):
+        class NoDockerRuntime:
+            def __init__(self):
+                self.processes = SimpleNamespace(server_ids=lambda: [SERVER_ID])
+
+            def _run(self, *_args, **_kwargs):
+                raise AssertionError("docker får inte anropas när noden saknar CLI")
+
+        agent = self._agent(NoDockerRuntime())
+        agent._docker_cli = False
+
+        self.assertEqual([SERVER_ID], agent._assigned_server_ids())
+
+    def test_assignment_discovery_survives_a_docker_that_stopped_working(self):
+        class BrokenDockerRuntime:
+            def __init__(self):
+                self.processes = SimpleNamespace(server_ids=lambda: [SERVER_ID])
+
+            def _run(self, *_args, **_kwargs):
+                raise agent_module.DockerError("Docker operation failed or timed out")
+
+        agent = self._agent(BrokenDockerRuntime())
+        agent._docker_cli = True
+
+        with self.assertLogs("craftpilot.runtime_agent", level="WARNING"):
+            self.assertEqual([SERVER_ID], agent._assigned_server_ids())
+        self.assertFalse(agent._docker_cli, "ett trasigt docker ska inte frågas varje poll")
+
 if __name__ == "__main__":
     unittest.main()
