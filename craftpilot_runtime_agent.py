@@ -31,6 +31,11 @@ import process_runtime
 from pathlib import Path
 from typing import Any
 
+try:  # Sätts av bygget (craftpilot-agent.spec); källkörning rapporterar "dev".
+    from _build_version import BUILD_VERSION as AGENT_VERSION
+except ImportError:  # pragma: no cover - alltid satt i den byggda exe:n
+    AGENT_VERSION = "dev"
+
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 CONTAINER_RE = re.compile(r"^craftpilot-[0-9a-f]{8}$")
 DOCKER_ID_RE = re.compile(r"^[0-9a-f]{12,64}$", re.I)
@@ -266,6 +271,10 @@ class DockerRuntime:
                 except process_runtime.ProcessError as exc:
                     raise AgentError(str(exc)) from exc
             return self._stop(server_id, expected_name, force)
+        if command_type == "cancel_start":
+            return self._cancel_start(server_id, expected_name)
+        if command_type == "delete_server":
+            return self._delete_server(server_id, expected_name)
         if command_type == "console":
             command = payload.get("command")
             if self.processes.is_process_server(server_id):
@@ -1423,6 +1432,74 @@ class DockerRuntime:
         entries.sort(key=lambda entry: (entry[0], entry[1]))
         return [entry[2] for entry in entries[-LOG_WINDOW:]]
 
+    def _cancel_start(self, server_id: str, name: str) -> dict[str, Any]:
+        """Avbryt en start som hänger: stoppa processen eller containern hårt.
+
+        Mastern sätter CANCELLED först när agenten bekräftar, så statusen
+        speglar alltid vad noden faktiskt gjorde. Idempotent: en server som
+        redan är stoppad svarar ALREADY_STOPPED och mastern går till CANCELLED
+        ändå.
+        """
+        if self.processes.is_process_server(server_id):
+            status, _exit_code = self.processes.status(server_id)
+            if status != "running":
+                return {"success": True, "result_code": "ALREADY_STOPPED"}
+            try:
+                self.processes.stop(server_id, force=True)
+            except process_runtime.ProcessError as exc:
+                raise AgentError(str(exc)) from exc
+            LOGGER.info("server_process_start_cancelled server_id=%s", server_id)
+            return {"success": True, "result_code": "START_CANCELLED"}
+        # _stop svarar ALREADY_STOPPED när containern redan är borta och kastar
+        # DockerError först när stoppet faktiskt misslyckades.
+        if self._stop(server_id, name, force=True)["result_code"] == "ALREADY_STOPPED":
+            return {"success": True, "result_code": "ALREADY_STOPPED"}
+        LOGGER.info("server_container_start_cancelled server_id=%s", server_id)
+        return {"success": True, "result_code": "START_CANCELLED"}
+
+    def _delete_server(self, server_id: str, name: str) -> dict[str, Any]:
+        """Ta bort serverns data och runtime-spår på noden.
+
+        Ingår i serverns borttagning i mastern. Ordningen är process/container
+        först och filer sist, så en process som fortfarande skriver inte kan
+        återskapa katalogen. Idempotent: saknad container, saknad process och
+        saknad katalog är alla ett lyckat resultat.
+        """
+        if self.processes.is_process_server(server_id):
+            try:
+                self.processes.delete(server_id)
+            except process_runtime.ProcessError as exc:
+                raise AgentError(str(exc)) from exc
+        else:
+            # Utan Docker-CLI (process-nod) eller utan container är detta en
+            # no-op; _run kastar OSError när binären saknas.
+            try:
+                self._run(["docker", "rm", "--force", name], timeout=60)
+                LOGGER.info("server_container_removed server_id=%s", server_id)
+            except (DockerError, OSError):
+                LOGGER.info("server_container_remove_noop server_id=%s", server_id)
+        directory = self._deletable_server_directory(server_id)
+        if directory is not None:
+            try:
+                shutil.rmtree(directory)
+            except OSError as exc:
+                raise AgentError("server data could not be removed") from exc
+            LOGGER.info("server_data_deleted server_id=%s", server_id)
+        return {"success": True, "result_code": "SERVER_DELETED"}
+
+    def _deletable_server_directory(self, server_id: str) -> Path | None:
+        """Serverns katalog, kontrollerad mot data-roten (AGENTS §6).
+
+        None när katalogen redan är borta; en symlink eller en sökväg som
+        lämnar roten vägras av _server_data_path.
+        """
+        candidate = self.config.data_root / server_id
+        if candidate.is_symlink():
+            raise AgentError("server data path is a symlink")
+        if not candidate.exists():
+            return None
+        return self._server_data_path(server_id)
+
     def _logs_for_server(self, server_id: str, name: str, since: str | None = None) -> list[dict[str, str]]:
         """Nya konsolrader för en server, oavsett runtime-typ."""
         if self.processes.is_process_server(server_id):
@@ -1560,7 +1637,8 @@ class RuntimeNodeAgent:
             token = self.config.registration_token
             if not token or not 32 <= len(token) <= 128:
                 raise AgentError("registration token is required for first enrollment")
-            result = self._request("POST", f"/api/runtime/nodes/{self.config.node_id}/register", {"registration_token": token})
+            result = self._request("POST", f"/api/runtime/nodes/{self.config.node_id}/register",
+                                   {"registration_token": token, "agent_version": AGENT_VERSION})
             credential = result.get("credential")
             if result.get("node_id") != self.config.node_id or not isinstance(credential, str) or not re.fullmatch(r"[A-Za-z0-9]{64}", credential):
                 raise AgentError("master returned an invalid registration response")
@@ -1592,7 +1670,7 @@ class RuntimeNodeAgent:
         if isinstance(token, str) and 32 <= len(token) <= 128:
             try:
                 result = self._request("POST", f"/api/runtime/nodes/{node_id}/register",
-                                       {"registration_token": token})
+                                       {"registration_token": token, "agent_version": AGENT_VERSION})
             except HttpStatusError as exc:
                 if exc.status != 401:
                     raise
@@ -1650,7 +1728,7 @@ class RuntimeNodeAgent:
 
     def _post_enrollment_request(self) -> tuple[str, str]:
         result = self._request("POST", "/api/runtime/enrollments", {
-            "hostname": socket.gethostname()[:255] or "craftpilot-agent", "agent_version": "local-docker",
+            "hostname": socket.gethostname()[:255] or "craftpilot-agent", "agent_version": AGENT_VERSION,
         })
         request_id, request_secret = result.get("request_id"), result.get("request_secret")
         if not isinstance(request_id, str) or not UUID_RE.fullmatch(request_id) or not isinstance(request_secret, str) or not re.fullmatch(r"[A-Za-z0-9]{64}", request_secret):
@@ -1815,7 +1893,8 @@ class RuntimeNodeAgent:
                 self.poll_enrollment_once()
                 return "not-ready"
         sequence = self._bump_sequence()
-        claim = self._request("POST", f"/api/runtime/nodes/{self.config.node_id}/commands/claim", {"sequence": sequence}, credential=True)
+        claim = self._request("POST", f"/api/runtime/nodes/{self.config.node_id}/commands/claim",
+                              {"sequence": sequence, "agent_version": AGENT_VERSION}, credential=True)
         self._apply_node_settings(claim.get("node_settings"))
         command = claim.get("command")
         if command is None:
