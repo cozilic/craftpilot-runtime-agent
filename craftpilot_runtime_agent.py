@@ -1445,13 +1445,10 @@ class DockerRuntime:
                 raise AgentError(str(exc)) from exc
             LOGGER.info("server_process_start_cancelled server_id=%s", server_id)
             return {"success": True, "result_code": "START_CANCELLED"}
-        try:
-            result = self._stop(server_id, name, force=True)
-        except DockerError:
-            # Ingen container att avbryta (t.ex. den skapades aldrig).
+        # _stop svarar ALREADY_STOPPED när containern redan är borta och kastar
+        # DockerError först när stoppet faktiskt misslyckades.
+        if self._stop(server_id, name, force=True)["result_code"] == "ALREADY_STOPPED":
             return {"success": True, "result_code": "ALREADY_STOPPED"}
-        if result.get("result_code") == "ALREADY_STOPPED":
-            return result
         LOGGER.info("server_container_start_cancelled server_id=%s", server_id)
         return {"success": True, "result_code": "START_CANCELLED"}
 
@@ -1468,7 +1465,9 @@ class DockerRuntime:
                 self.processes.delete(server_id)
             except process_runtime.ProcessError as exc:
                 raise AgentError(str(exc)) from exc
-        elif shutil.which("docker") is not None:
+        else:
+            # Utan Docker-CLI (process-nod) eller utan container är detta en
+            # no-op; _run kastar OSError när binären saknas.
             try:
                 self._run(["docker", "rm", "--force", name], timeout=60)
                 LOGGER.info("server_container_removed server_id=%s", server_id)
@@ -1484,19 +1483,17 @@ class DockerRuntime:
         return {"success": True, "result_code": "SERVER_DELETED"}
 
     def _deletable_server_directory(self, server_id: str) -> Path | None:
-        """Serverns katalog, kontrollerad mot data-roten (AGENTS §6)."""
-        root = self.config.data_root.resolve(strict=True)
-        candidate = root / server_id
+        """Serverns katalog, kontrollerad mot data-roten (AGENTS §6).
+
+        None när katalogen redan är borta; en symlink eller en sökväg som
+        lämnar roten vägras av _server_data_path.
+        """
+        candidate = self.config.data_root / server_id
         if candidate.is_symlink():
             raise AgentError("server data path is a symlink")
         if not candidate.exists():
             return None
-        if not candidate.is_dir():
-            raise AgentError("server data path is not a directory")
-        resolved = candidate.resolve(strict=True)
-        if resolved.parent != root or resolved == root:
-            raise AgentError("server data path escapes the configured root")
-        return resolved
+        return self._server_data_path(server_id)
 
     def _logs_for_server(self, server_id: str, name: str, since: str | None = None) -> list[dict[str, str]]:
         """Nya konsolrader för en server, oavsett runtime-typ."""

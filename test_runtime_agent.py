@@ -2156,6 +2156,23 @@ class CancelAndDeleteTests(unittest.TestCase):
 
         self.assertEqual("ALREADY_STOPPED", result["result_code"])
 
+    def test_cancel_start_does_not_report_success_when_docker_is_unreachable(self):
+        class UnreachableDocker(FakeDocker):
+            def __call__(self, args, **kwargs):
+                if args[:3] == ["docker", "inspect", "--format"]:
+                    self.calls.append(list(args))
+                    return SimpleNamespace(
+                        returncode=1, stdout="",
+                        stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+                    )
+                return super().__call__(args, **kwargs)
+
+        self.runtime.runner = UnreachableDocker([])
+
+        # Mastern får aldrig CANCELLED när stoppet inte gick att utföra.
+        with self.assertRaises(agent_module.DockerError):
+            self.runtime.execute("cancel_start", {"server_id": SERVER_ID})
+
     def test_cancel_start_kills_a_started_container(self):
         labels = json.dumps({"craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID})
         self.runtime.runner = FakeDocker(["true", labels, "false"])
