@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 import file_tree_index
 import migration_transfer
 import process_runtime
+import sftp_runtime
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,7 @@ CONTAINER_RE = re.compile(r"^craftpilot-[0-9a-f]{8}$")
 DOCKER_ID_RE = re.compile(r"^[0-9a-f]{12,64}$", re.I)
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 USER_RE = re.compile(r"^[0-9]{1,10}:[0-9]{1,10}$")
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 LOG_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$")
 # Antal loggrader som följer med i en telemetrirapport. Fönstret måste
 # rymma en chattrad även på en pratig modpack-server: agenten rapporterar
@@ -108,6 +110,19 @@ class Config:
     # Java-binär per huvudversion (CRAFTPILOT_JAVA_BINARIES). En process-nod
     # kör den JRE mastern valde, aldrig den som råkade ligga först i PATH.
     java_binaries: dict[int, str] = field(default_factory=dict)
+    # SFTPGo på noden (docs/RUNTIME-NODE-SFTP.md i CraftPilot). Av som default:
+    # en uppgraderad agent ska inte starta en ny container förrän operatören
+    # uttryckligen slår på den.
+    sftp_enabled: bool = False
+    sftp_image: str = sftp_runtime.DEFAULT_IMAGE
+    sftp_port: int = 2222
+    sftp_network: str = sftp_runtime.DEFAULT_NETWORK
+    sftp_container_name: str = sftp_runtime.DEFAULT_CONTAINER
+    sftp_admin_url: str = sftp_runtime.DEFAULT_ADMIN_URL
+    sftp_admin_username: str = sftp_runtime.DEFAULT_ADMIN_USERNAME
+    sftp_home: str = sftp_runtime.DEFAULT_HOME_ROOT
+    sftp_uid: int = 33
+    sftp_gid: int = 33
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -131,6 +146,30 @@ class Config:
         network = os.environ.get("CRAFTPILOT_DOCKER_NETWORK", "craftpilot-servers")
         poll_seconds = _bounded_int("CRAFTPILOT_POLL_SECONDS", 5, 2, 120)
         stop_grace = _bounded_int("CRAFTPILOT_STOP_GRACE_SECONDS", 30, 0, 45)
+        sftp_enabled = _env_flag("CRAFTPILOT_SFTP_ENABLED", False)
+        sftp_image = os.environ.get("CRAFTPILOT_SFTP_IMAGE", sftp_runtime.DEFAULT_IMAGE).strip()
+        if not sftp_runtime.IMAGE_RE.fullmatch(sftp_image):
+            raise AgentError("CRAFTPILOT_SFTP_IMAGE is invalid")
+        sftp_port = _bounded_int("CRAFTPILOT_SFTP_PORT", 2222, 1, 65535)
+        sftp_network = os.environ.get("CRAFTPILOT_SFTP_NETWORK", sftp_runtime.DEFAULT_NETWORK)
+        if not NAME_RE.fullmatch(sftp_network):
+            raise AgentError("CRAFTPILOT_SFTP_NETWORK is invalid")
+        sftp_container = os.environ.get("CRAFTPILOT_SFTP_CONTAINER_NAME", sftp_runtime.DEFAULT_CONTAINER)
+        if not NAME_RE.fullmatch(sftp_container) or not sftp_container.startswith("craftpilot-"):
+            raise AgentError("CRAFTPILOT_SFTP_CONTAINER_NAME is invalid")
+        sftp_admin_url = (os.environ.get("CRAFTPILOT_SFTP_ADMIN_URL")
+                          or sftp_runtime.DEFAULT_ADMIN_URL).rstrip("/")
+        _validate_sftp_admin_url(sftp_admin_url)
+        sftp_admin_username = (os.environ.get("CRAFTPILOT_SFTP_ADMIN_USERNAME")
+                               or sftp_runtime.DEFAULT_ADMIN_USERNAME)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", sftp_admin_username):
+            raise AgentError("CRAFTPILOT_SFTP_ADMIN_USERNAME is invalid")
+        sftp_home = os.environ.get("CRAFTPILOT_SFTP_HOME", sftp_runtime.DEFAULT_HOME_ROOT).rstrip("/") or "/"
+        if (not sftp_home.startswith("/") or CONTROL_RE.search(sftp_home)
+                or ".." in sftp_home.split("/")):
+            raise AgentError("CRAFTPILOT_SFTP_HOME is invalid")
+        sftp_uid = _bounded_int("CRAFTPILOT_SFTP_UID", 33, 0, 2**31 - 1)
+        sftp_gid = _bounded_int("CRAFTPILOT_SFTP_GID", data_gid, 0, 2**31 - 1)
         if node_id is not None and not UUID_RE.fullmatch(node_id):
             raise AgentError("CRAFTPILOT_NODE_ID must be a node UUID")
         if not master.startswith("https://"):
@@ -144,7 +183,41 @@ class Config:
             docker_data_root=os.environ.get("CRAFTPILOT_DOCKER_SERVER_DATA_ROOT") or None,
             data_gid=data_gid,
             java_binaries=java_binaries,
+            sftp_enabled=sftp_enabled,
+            sftp_image=sftp_image,
+            sftp_port=sftp_port,
+            sftp_network=sftp_network,
+            sftp_container_name=sftp_container,
+            sftp_admin_url=sftp_admin_url,
+            sftp_admin_username=sftp_admin_username,
+            sftp_home=sftp_home,
+            sftp_uid=sftp_uid,
+            sftp_gid=sftp_gid,
         )
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Miljöflagga som bara accepterar tydliga true/false-värden."""
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off", ""):
+        return False
+    raise AgentError(f"{name} must be true or false")
+
+
+def _validate_sftp_admin_url(url: str) -> None:
+    """Admin-API:t ska vara en intern HTTP(S)-origin, utan credentials."""
+
+    parsed = urllib.parse.urlsplit(url)
+    if (parsed.scheme not in ("http", "https") or not parsed.netloc
+            or parsed.username is not None or parsed.password is not None
+            or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
+        raise AgentError("CRAFTPILOT_SFTP_ADMIN_URL must be an internal HTTP(S) origin")
 
 
 def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -1575,9 +1648,19 @@ class StateStore:
 
 
 class RuntimeNodeAgent:
-    def __init__(self, config: Config, runtime: DockerRuntime | None = None, store: StateStore | None = None):
+    def __init__(self, config: Config, runtime: DockerRuntime | None = None, store: StateStore | None = None,
+                 sftp: sftp_runtime.SftpNode | None = None):
         self.config, self.runtime = config, runtime or DockerRuntime(config)
         self.store = store or StateStore(config.state_dir)
+        # SFTPGo på noden. Bara Docker-noder kan ha den; en process-nod (t.ex.
+        # Windows-exe:n utan Docker Desktop) rapporterar aldrig `sftp`.
+        self.sftp = sftp
+        if self.sftp is None and config.sftp_enabled and isinstance(self.runtime, DockerRuntime):
+            self.sftp = sftp_runtime.SftpNode(self._sftp_settings())
+        # Cachas mellan pollarna så claim kan bära dem. `None` = rapportera
+        # inget den här gången; mastern behåller då sitt sparade värde.
+        self._sftp_features: list[str] | None = None
+        self._sftp_fingerprint: str | None = None
         self.file_tree_index = file_tree_index.FileTreeIndex(config.data_root, config.state_dir)
         self._last_file_tree_progress = self.file_tree_index.progress
         self._last_reported_file_tree_progress: str | None = None
@@ -1845,11 +1928,86 @@ class RuntimeNodeAgent:
         return True
 
     def poll_once(self) -> None:
+        # SFTP-synken går före claim så att features och värdnyckel följer med
+        # i samma poll. Console-tickarna hoppar över den (de går varje sekund).
+        self._sync_sftp()
         if self._claim_and_execute() == "not-ready":
             return
         assert self.state is not None
         self._report_servers(self.state["sequence"])
         self._sync_file_tree_cache()
+
+    def _sftp_settings(self) -> sftp_runtime.SftpSettings:
+        return sftp_runtime.SftpSettings(
+            state_dir=self.config.state_dir,
+            data_root=self.config.data_root,
+            docker_data_root=self.config.docker_data_root,
+            image=self.config.sftp_image,
+            port=self.config.sftp_port,
+            network=self.config.sftp_network,
+            container_name=self.config.sftp_container_name,
+            admin_url=self.config.sftp_admin_url,
+            admin_username=self.config.sftp_admin_username,
+            home_root=self.config.sftp_home,
+            uid=self.config.sftp_uid,
+            gid=self.config.sftp_gid,
+            agent_container_name=os.environ.get("CRAFTPILOT_AGENT_CONTAINER_NAME",
+                                                "craftpilot-runtime-agent"),
+        )
+
+    def _sync_sftp(self) -> None:
+        """Applicera masterns SFTP-läge och cacha värdnyckeln för claim.
+
+        Ett fel här får aldrig stoppa servernas telemetri: noden slutar bara
+        rapportera `sftp`, så panelen säger att slutpunkten inte är tillgänglig.
+        En avvisad credential måste däremot bubbla upp till re-enrollment.
+        """
+
+        if self.sftp is None or self.state is None or self.state.get("enrollment_request_id"):
+            return
+        try:
+            fingerprint = self.sftp.ensure_ready()
+            if fingerprint is None:
+                self._sftp_features = None
+                self._sftp_fingerprint = None
+                return
+            state = self._request("GET", f"/api/runtime/nodes/{self.config.node_id}/sftp")
+            self.sftp.apply_state(state, set(self._assigned_server_ids()), self._sftp_server_path)
+            self._sftp_features = ["sftp"]
+            self._sftp_fingerprint = fingerprint
+        except CredentialRejectedError:
+            raise
+        except (AgentError, sftp_runtime.SftpError, OSError, TimeoutError) as exc:
+            LOGGER.warning("sftp_sync_failed error=%s", str(exc)[:200])
+            self._sftp_features = None
+            self._sftp_fingerprint = None
+
+    def _sftp_server_path(self, server_id: str) -> str:
+        """Serverkatalogen så Docker-daemonen ser den (virtual folder-mål).
+
+        Sökvägen byggs ur det validerade server-id:t under nodens data root;
+        SFTP-modulen avvisar sedan allt som ligger utanför Docker-roten. En
+        server som ännu inte startat har ingen katalog än, men mappen kan ändå
+        förberedas — SFTPGo kräver inte att målet finns när foldern skapas.
+        """
+
+        if not isinstance(server_id, str) or not UUID_RE.fullmatch(server_id):
+            raise AgentError("SFTP folder has an invalid server id")
+        candidate = self.config.data_root / server_id
+        if os.path.islink(candidate):
+            raise AgentError("SFTP server path is a symlink")
+        if candidate.exists():
+            try:
+                root = self.config.data_root.resolve(strict=True)
+                resolved = candidate.resolve(strict=True)
+            except OSError as exc:
+                raise AgentError("SFTP server path cannot be resolved") from exc
+            if resolved.parent != root:
+                raise AgentError("SFTP server path escapes the data root")
+        resolver = getattr(self.runtime, "_docker_server_data_path", None)
+        if resolver is None:
+            raise AgentError("SFTP folder paths require a Docker runtime")
+        return resolver(server_id)
 
     def _console_tick(self) -> None:
         """Snabb tick mellan de vanliga pollarna (se CONSOLE_TICK_SECONDS).
@@ -1893,8 +2051,13 @@ class RuntimeNodeAgent:
                 self.poll_enrollment_once()
                 return "not-ready"
         sequence = self._bump_sequence()
+        claim_body: dict[str, Any] = {"sequence": sequence, "agent_version": AGENT_VERSION}
+        if self._sftp_features:
+            claim_body["features"] = list(self._sftp_features)
+        if self._sftp_fingerprint:
+            claim_body["sftp_host_key_fingerprint"] = self._sftp_fingerprint
         claim = self._request("POST", f"/api/runtime/nodes/{self.config.node_id}/commands/claim",
-                              {"sequence": sequence, "agent_version": AGENT_VERSION}, credential=True)
+                              claim_body, credential=True)
         self._apply_node_settings(claim.get("node_settings"))
         command = claim.get("command")
         if command is None:
@@ -2528,16 +2691,21 @@ class RuntimeNodeAgent:
         self.node_settings = {"name": name, "max_servers": max_servers, "poll_interval_seconds": poll_seconds}
         self.poll_seconds = poll_seconds
 
-    def _request(self, method: str, path: str, body: dict[str, Any], credential: bool = False) -> dict[str, Any]:
+    def _request(self, method: str, path: str, body: dict[str, Any] | None = None,
+                 credential: bool = False) -> dict[str, Any]:
         if not path.startswith("/api/") or ".." in path:
             raise AgentError("invalid master API path")
         assert self.state is not None or not credential
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        headers = {"Accept": "application/json"}
+        data = None
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(body, separators=(",", ":")).encode("utf-8")
         if credential:
             assert self.state is not None
             headers["Authorization"] = f"Bearer {self.state['credential']}"
         request = urllib.request.Request(self.config.master_url + path,
-            data=json.dumps(body, separators=(",", ":")).encode("utf-8"), headers=headers, method=method)
+            data=data, headers=headers, method=method)
         try:
             with self._opener.open(request, timeout=15) as response:
                 if not 200 <= response.status < 300:

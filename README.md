@@ -20,6 +20,7 @@ The current agent supports a focused set of operations:
 - **Console command delivery** over authenticated RCON.
 - **Node and server telemetry**, including container status, resource usage, uptime, disk usage, and a bounded log stream.
 - **Process servers** (`runtime_kind=process`): the same start/stop/console/log/telemetry contract for servers the master runs as plain java processes on a node without Docker, chosen per server from the Java version the master asks for.
+- **Node-local SFTP** (SFTPGo): public-key accounts whose home directories map to the node's assigned servers, and the node's SSH host-key fingerprint reported to the master.
 
 The agent does **not** currently migrate existing worlds or provide remote file operations. A running container does not by itself guarantee player connectivity: the node operator must configure the firewall and ensure the CraftPilot Gate can reach the node’s advertised Minecraft address and ports.
 
@@ -224,6 +225,12 @@ The checked-in `.env.example` provides safe defaults, including `CRAFTPILOT_MAST
 | `CRAFTPILOT_REGISTRATION_TOKEN` | Empty | One-time token used only when an explicitly disabled node is re-enabled. Remove it after registration succeeds. |
 | `CRAFTPILOT_SERVER_DATA_GID` | `33` | Group used for shared server data; matches the default Minecraft container user (`33:33`). |
 | `CRAFTPILOT_DOCKER_NETWORK` | `craftpilot-servers` | Isolated bridge network for game containers. |
+| `CRAFTPILOT_SFTP_ENABLED` | `false` | Run a sibling SFTPGo container for this node and report `sftp` and the host-key fingerprint to the master. |
+| `CRAFTPILOT_SFTP_PORT` | `2222` | Host port published for SFTP (`2022` inside the container); open it in the firewall. |
+| `CRAFTPILOT_SFTP_IMAGE` | `drakkan/sftpgo:v2.6.4` | Pinned SFTPGo image. |
+| `CRAFTPILOT_SFTP_NETWORK` | `craftpilot-sftp` | Private bridge network shared by the agent and SFTPGo; the admin API is never published there. |
+| `CRAFTPILOT_SFTP_ADMIN_URL` | `http://craftpilot-sftp:8080` | Internal SFTPGo admin API origin. |
+| `CRAFTPILOT_SFTP_HOME` | `/sftp-home` | SFTPGo home root inside its container. |
 | `CRAFTPILOT_JAVA_BINARIES` | Empty | Process nodes only: JRE per Java major version, e.g. `21=/opt/jdk-21/bin/java,17=/opt/jdk-17/bin/java`. Absolute paths; a server whose version is missing is refused instead of run on the wrong JRE. |
 | `CRAFTPILOT_ALLOWED_IMAGES` | Temurin JRE 8, 11, 17, 21 and 25 images | Comma-separated exact image allowlist. |
 | `CRAFTPILOT_POLL_SECONDS` | `30` | Polling interval; allowed range is 5–120 seconds. |
@@ -241,6 +248,16 @@ A node registered with `runtime_kind=process` runs its servers as local java pro
 Stop uses the server's own `stop` console command and falls back to SIGTERM; force stop uses SIGKILL. Process state and the last exit code live in `processes.json` in the agent state directory, so a crashed server reports `CRASHED` with its code, a clean or intentional stop reports `OFFLINE`, and console lines are tailed from `process-logs/<server-id>.log` with the same dedupe cursor as containers. CPU and memory figures are not collected for process servers; the memory limit is reported as configured.
 
 `cancel_start` aborts a start that the master is still showing as `STARTING`: it stops the process with SIGKILL (containers get `docker kill --signal=KILL` and `docker rm --force`) and answers `START_CANCELLED`, or `ALREADY_STOPPED` when nothing was running any more. `delete_server` stops a running process or container, removes the container, deletes the server's data directory and finally drops its process record and log file. The data directory is resolved under `CRAFTPILOT_SERVER_DATA_ROOT`; the root itself, symlinked directories and paths that escape the root are refused, and deleting a server that is already gone still answers `SERVER_DELETED` so the master's retry does not get stuck.
+
+### SFTP (SFTPGo)
+
+With `CRAFTPILOT_SFTP_ENABLED=true` the agent runs a pinned SFTPGo container next to itself. It creates the `craftpilot-sftp` bridge network, joins it, keeps SFTPGo's database and home directories on the named volumes `craftpilot-sftp-data` and `craftpilot-sftp-home`, and publishes only the SFTP port (`2022` inside the container, `CRAFTPILOT_SFTP_PORT` on the host). The admin API stays on the private network and is never published.
+
+On each poll the agent fetches the complete desired SFTP state from the master and upserts folders and `u<id>` accounts, so a removed account or key disappears on the node. Server folders are mounted from the same host path as game-container data; a path outside `CRAFTPILOT_DOCKER_SERVER_DATA_ROOT`, a server the node is not assigned, or an unsafe folder name is refused. This release creates accounts only for public keys: the password channel is a separate step, and a user without keys is not created (and an existing account is removed).
+
+The admin password is generated once and stored as `sftpgo-admin-password` (mode `0600`) in the agent state directory; it is never logged or written to `agent-state.json`. Back it up with the state volume, because the existing SFTPGo database keeps that password. If SFTPGo cannot start or its status has no usable SHA-256 host key, the node reports no `sftp` feature rather than advertising a broken endpoint; the claim carries `features: ["sftp"]` and `sftp_host_key_fingerprint` only while SFTPGo answers.
+
+Open the published SFTP port in the host firewall and confirm it is reachable from outside before relying on it. Existing installs keep SFTP off until the variable is set.
 
 ## Operations and safety
 
