@@ -33,6 +33,12 @@ services:
       CRAFTPILOT_DOCKER_SERVER_DATA_ROOT: "${CRAFTPILOT_DOCKER_SERVER_DATA_ROOT:-${CRAFTPILOT_SERVER_DATA_HOST_PATH:-/srv/craftpilot/servers}}"
       CRAFTPILOT_SERVER_DATA_GID: ${CRAFTPILOT_SERVER_DATA_GID:-33}
       CRAFTPILOT_DOCKER_NETWORK: ${CRAFTPILOT_DOCKER_NETWORK:-craftpilot-servers}
+      # SFTPGo on this node. Disabled by default; enabling it makes the agent
+      # create the craftpilot-sftp network and container and publish this port.
+      CRAFTPILOT_SFTP_ENABLED: ${CRAFTPILOT_SFTP_ENABLED:-false}
+      CRAFTPILOT_SFTP_PORT: ${CRAFTPILOT_SFTP_PORT:-2222}
+      CRAFTPILOT_SFTP_IMAGE: ${CRAFTPILOT_SFTP_IMAGE:-drakkan/sftpgo:v2.6.4}
+      CRAFTPILOT_AGENT_CONTAINER_NAME: craftpilot-runtime-agent
       CRAFTPILOT_LOG_LEVEL: ${CRAFTPILOT_LOG_LEVEL:-INFO}
     volumes:
       - "${CRAFTPILOT_DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock"
