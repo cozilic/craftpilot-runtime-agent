@@ -16,7 +16,7 @@ RUN python -m pip install --no-cache-dir --upgrade pip \
     && python -c "import cryptography; assert cryptography.__version__ == '46.0.5'"
 
 WORKDIR /opt/craftpilot-runtime-agent
-COPY craftpilot_runtime_agent.py migration_transfer.py file_tree_index.py process_runtime.py sftp_runtime.py ./
+COPY craftpilot_runtime_agent.py migration_transfer.py file_tree_index.py network_stats.py process_runtime.py sftp_runtime.py ./
 COPY test_migration_transfer.py ./
 
 # Versionen som imagen rapporterar till mastern. Publish-workflowen skickar
