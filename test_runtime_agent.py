@@ -1397,7 +1397,7 @@ class DockerRuntimeTests(unittest.TestCase):
                 raise AssertionError(args)
 
         (self.config.data_root / SERVER_ID / "server.jar").write_bytes(b"x" * 8)
-        runner = PartiallyFailingDocker(["true", labels, "running", "2026-10-26T10:00:00Z|0|123"])
+        runner = PartiallyFailingDocker(["true", labels, "running", "2026-10-26T10:00:00Z|0|123", "a" * 64])
         report = RuntimeNodeAgent(self.config, runtime=DockerRuntime(self.config, runner))._server_report(
             SERVER_ID, 8, artifact_check={"jar": "server.jar", "min_bytes": 8},
         )
@@ -2258,6 +2258,139 @@ class CancelAndDeleteTests(unittest.TestCase):
         with self.assertRaisesRegex(agent_module.AgentError, "symlink"):
             self.runtime.execute("delete_server", {"server_id": SERVER_ID})
         self.assertTrue((outside / "keep.txt").exists())
+
+
+class NetworkCounterReportTests(unittest.TestCase):
+    """Räknarna i rapporten: heltal, bara körande container, aldrig bps."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.config = make_config(self.root)
+        self.config.data_root.mkdir(parents=True, exist_ok=True)
+        self.labels = json.dumps({"craftpilot.managed": "1", "craftpilot.server_id": SERVER_ID})
+        self.container_id = "a" * 64
+
+    def _running_report(self, sequence: int = 7, counters=(184467321, 98765432)):
+        runner = FakeDocker(["true", self.labels, "running", "2026-10-26T10:00:00Z", self.container_id])
+        agent = RuntimeNodeAgent(self.config, runtime=DockerRuntime(self.config, runner))
+        with patch.object(agent_module.network_stats, "container_net_io", return_value=counters) as measured:
+            return agent._server_report(SERVER_ID, sequence), measured
+
+    def test_report_sends_cumulative_counters_as_plain_integers(self):
+        report, measured = self._running_report()
+
+        self.assertEqual("ONLINE", report["status"])
+        self.assertEqual(184467321, report["network_rx_bytes"])
+        self.assertEqual(98765432, report["network_tx_bytes"])
+        self.assertIsInstance(report["network_rx_bytes"], int)
+        self.assertNotIsInstance(report["network_rx_bytes"], bool)
+        self.assertTrue(all(not key.endswith("_bps") for key in report))
+        # Containerns id, inte ett gissat namn, är det som frågas.
+        self.assertEqual((self.container_id,), measured.call_args.args)
+
+    def test_stopped_container_reports_null_and_never_reads_the_api(self):
+        runner = FakeDocker(["false", self.labels, "exited", "0"])
+        agent = RuntimeNodeAgent(self.config, runtime=DockerRuntime(self.config, runner))
+        with patch.object(agent_module.network_stats, "container_net_io", return_value=(1, 1)) as measured:
+            report = agent._server_report(SERVER_ID, 8)
+
+        self.assertEqual("OFFLINE", report["status"])
+        self.assertIsNone(report["network_rx_bytes"])
+        self.assertIsNone(report["network_tx_bytes"])
+        measured.assert_not_called()
+
+    def test_report_is_still_sent_when_the_container_api_fails(self):
+        for failure in ({"return_value": None}, {"side_effect": OSError("docker socket missing")}):
+            with self.subTest(failure=failure):
+                runner = FakeDocker(["true", self.labels, "running", "2026-10-26T10:00:00Z", self.container_id])
+                agent = RuntimeNodeAgent(self.config, runtime=DockerRuntime(self.config, runner))
+                with patch.object(agent_module.network_stats, "container_net_io", **failure):
+                    report = agent._server_report(SERVER_ID, 9)
+
+                self.assertEqual("ONLINE", report["status"])
+                self.assertIsNone(report["network_rx_bytes"])
+                self.assertIsNone(report["network_tx_bytes"])
+
+    def test_restarted_counters_are_forwarded_raw_without_a_derived_rate(self):
+        readings = iter([(5000, 900), (12, 3)])
+        reports = []
+        for sequence in (1, 2):
+            runner = FakeDocker(["true", self.labels, "running", "2026-10-26T10:00:00Z", self.container_id])
+            agent = RuntimeNodeAgent(self.config, runtime=DockerRuntime(self.config, runner))
+            with patch.object(agent_module.network_stats, "container_net_io",
+                              side_effect=lambda _container_id: next(readings)):
+                reports.append(agent._server_report(SERVER_ID, sequence))
+
+        # En nyskapad container börjar om på noll; mastern ser bakåtgången och
+        # lämnar hastigheten null. Agenten ska inte räkna eller klippa värdet.
+        self.assertEqual((5000, 900), (reports[0]["network_rx_bytes"], reports[0]["network_tx_bytes"]))
+        self.assertEqual((12, 3), (reports[1]["network_rx_bytes"], reports[1]["network_tx_bytes"]))
+        self.assertTrue(all(not key.endswith("_bps") for key in reports[1]))
+
+    def test_console_tick_remeasures_counters_instead_of_resending_cached_ones(self):
+        bodies: list[dict] = []
+        line = {"ts": "2026-10-26T10:00:05.000000000Z",
+                "text": "[Server thread/INFO]: Steve joined the game"}
+
+        class FakeRuntime:
+            config = self.config
+
+            def _logs_for_server(self, server_id, name, since=None):
+                return [dict(line)]
+
+        agent = RuntimeNodeAgent(self.config, runtime=FakeRuntime(), store=MemoryStateStore())
+        agent.state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 5}
+        agent._last_reports[SERVER_ID] = {
+            "sequence": 4, "server_id": SERVER_ID, "status": "ONLINE",
+            "cpu_percent": 1.0, "memory_used_mb": 512, "memory_limit_mb": 2048,
+            "network_rx_bytes": 100, "network_tx_bytes": 50,
+            "uptime_seconds": 120, "players_online": None, "players_max": None,
+            "disk_used_mb": 12, "artifact_present": None,
+        }
+        agent._container_net_io = lambda _name: (4000, 600)
+        agent._request = lambda method, path, body, credential=False: bodies.append(body) or {"ok": True}
+
+        agent._report_log_lines(6)
+
+        self.assertEqual(1, len(bodies))
+        self.assertEqual(4000, bodies[0]["network_rx_bytes"])
+        self.assertEqual(600, bodies[0]["network_tx_bytes"])
+        self.assertEqual(1, len(bodies[0]["logs"]))
+
+    def test_console_tick_keeps_unmeasured_counters_null(self):
+        bodies: list[dict] = []
+        line = {"ts": "2026-10-26T10:00:05.000000000Z", "text": "[Server thread/INFO]: ready"}
+
+        class FakeRuntime:
+            config = self.config
+
+            def _logs_for_server(self, server_id, name, since=None):
+                return [dict(line)]
+
+        agent = RuntimeNodeAgent(self.config, runtime=FakeRuntime(), store=MemoryStateStore())
+        agent.state = {"node_id": self.config.node_id, "credential": "c" * 64, "sequence": 5}
+        agent._last_reports[SERVER_ID] = {
+            "sequence": 4, "server_id": SERVER_ID, "status": "ONLINE",
+            "cpu_percent": None, "memory_used_mb": None, "memory_limit_mb": 2048,
+            "network_rx_bytes": None, "network_tx_bytes": None,
+            "uptime_seconds": 120, "players_online": None, "players_max": None,
+            "disk_used_mb": 12, "artifact_present": None,
+        }
+
+        def forbidden(_name):
+            raise AssertionError("en process-server har ingen container att mäta")
+
+        agent._container_net_io = forbidden
+        agent._request = lambda method, path, body, credential=False: bodies.append(body) or {"ok": True}
+
+        agent._report_log_lines(6)
+
+        self.assertEqual(1, len(bodies))
+        self.assertIsNone(bodies[0]["network_rx_bytes"])
+        self.assertIsNone(bodies[0]["network_tx_bytes"])
+
 
 if __name__ == "__main__":
     unittest.main()

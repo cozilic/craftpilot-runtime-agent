@@ -18,7 +18,7 @@ The current agent supports a focused set of operations:
 - **Initial snapshot staging** from the configured CraftPilot master.
 - **Start and stop** for managed Minecraft containers.
 - **Console command delivery** over authenticated RCON.
-- **Node and server telemetry**, including container status, resource usage, uptime, disk usage, and a bounded log stream.
+- **Node and server telemetry**, including container status, CPU and memory, cumulative network byte counters, uptime, disk usage, and a bounded log stream.
 - **Process servers** (`runtime_kind=process`): the same start/stop/console/log/telemetry contract for servers the master runs as plain java processes on a node without Docker, chosen per server from the Java version the master asks for.
 - **Node-local SFTP** (SFTPGo): public-key and one-time password accounts whose home directories map to the node's assigned servers, and the node's SSH host-key fingerprint reported to the master.
 
@@ -267,6 +267,7 @@ Open the published SFTP port in the host firewall and confirm it is reachable fr
 - Every start also forces `pause-when-empty-seconds=0`. Paper pauses an empty server, and a paused server stops answering RCON, which silently takes the panel console, chat triggers and the rules gate offline until a player joins. Vanilla ignores the unknown key. Console delivery retries a refused or timed-out RCON connection a couple of times before reporting failure, so a command queued while a server is still waking up is not lost.
 - Snapshot downloads are restricted to the configured HTTPS master origin. The agent verifies byte count and SHA-256, rejects ZIP traversal, symlinks, special files, and excessive decompression, extracts to a temporary directory, and will not overwrite a populated destination.
 - Telemetry includes at most 400 timestamped log lines per report (`LOG_WINDOW`), which keeps a chat line inside the window on a chatty modpack server. Log cursors advance only after the master accepts a report. While at least one reported server is online, the agent also samples new console lines about once a second, sends just those lines (the rest of the report reuses the last telemetry values), and claims queued console commands in the same tick, so chat triggers and the rules gate react in about a second instead of waiting for the next poll. Docker stats or log collection failures do not stop status polling.
+- Network traffic is reported as the container's cumulative `network_rx_bytes` and `network_tx_bytes` in raw bytes, summed over every interface, read from the Docker Engine API (`GET /containers/{id}/stats`) rather than the rounded `docker stats` CLI. The agent never sends a rate: the master derives bytes/s from two consecutive reports. A stopped container, a container without a network namespace (`--network host`), or an unreachable daemon reports `null`, so the panel shows no invented speed.
 - Logs are written to stderr and can be followed with `docker compose logs -f runtime-agent`. The default `INFO` level records lifecycle events and failures. Console command text, credentials, and RCON passwords are not logged. `DEBUG` adds Python diagnostic detail but does not enable payload or secret logging.
 - HTTPS certificate verification remains enabled, and HTTPS redirects are not followed.
 
