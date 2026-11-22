@@ -28,6 +28,7 @@ AgentError = agent_module.AgentError
 SERVER_ID = "e7b4b542-70b0-4cf7-a2ac-2a6597de165d"
 NODE_ID = "c4f6babc-0d57-4ab7-a71f-a6358498335a"
 FINGERPRINT = "SHA256:" + "A" * 43
+GOOD_PASSWORD = "CorrectHorseBatteryStaple"
 
 
 def make_state(users: list[dict[str, object]] | None = None, revision: str = "rev-1") -> dict[str, object]:
@@ -35,13 +36,14 @@ def make_state(users: list[dict[str, object]] | None = None, revision: str = "re
 
 
 def make_user(username: str = "u42", keys: list[str] | None = None,
-              folders: list[dict[str, str]] | None = None, enabled: bool = True) -> dict[str, object]:
+              folders: list[dict[str, str]] | None = None, enabled: bool = True,
+              password_set: bool = False, password_revision: int = 0) -> dict[str, object]:
     return {
         "username": username,
         "enabled": enabled,
         "public_keys": keys if keys is not None else ["ssh-ed25519 " + "A" * 60 + " user@example"],
-        "password_set": False,
-        "password_revision": 0,
+        "password_set": password_set,
+        "password_revision": password_revision,
         "folders": folders if folders is not None else [{"name": "myserver", "server_id": SERVER_ID}],
     }
 
@@ -321,6 +323,201 @@ class SftpStateTests(unittest.TestCase):
         self.assertIn(("folder", "myserver", server_path(SERVER_ID)), self.client.calls)
 
 
+class SftpPasswordTests(unittest.TestCase):
+    """Lösenordsrevisionen, minnet och kvittensen mot SFTPGo."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.client = FakeClient()
+        self.node = make_node(self.root, client=self.client)
+
+    def test_only_a_newer_password_revision_needs_a_secret(self):
+        state = make_state([make_user(password_set=True, password_revision=2)])
+
+        self.assertEqual({"u42": 2}, self.node.password_requirements(state))
+        self.node._password_revisions = {"u42": 2}
+        self.assertEqual({}, self.node.password_requirements(state))
+
+    def test_a_clear_never_requests_a_secret(self):
+        state = make_state([make_user(password_set=False, password_revision=3)])
+        self.node._password_revisions = {"u42": 2}
+        self.assertEqual({}, self.node.password_requirements(state))
+
+    def test_a_secret_is_applied_and_acknowledged_without_leaking_it(self):
+        state = make_state([make_user(password_set=True, password_revision=1)])
+
+        reports = self.node.apply_state(
+            state, {SERVER_ID}, server_path,
+            passwords={"u42": (1, GOOD_PASSWORD)},
+        )
+
+        payload = self.client.calls[1][1]
+        self.assertEqual(GOOD_PASSWORD, payload["password"])
+        self.assertEqual([{"username": "u42", "password_revision": 1}], reports)
+        self.assertEqual({"u42": 1}, self.node._password_revisions)
+        self.assertNotIn(GOOD_PASSWORD, json.dumps(reports))
+        self.assertNotIn(GOOD_PASSWORD, json.dumps(self.node._last_status))
+        self.assertNotIn(GOOD_PASSWORD, repr(self.node.__dict__))
+        self.assertEqual({}, self.node.password_requirements(state))
+
+    def test_a_missing_secret_leaves_the_key_account_without_a_password(self):
+        state = make_state([make_user(password_set=True, password_revision=3)])
+
+        reports = self.node.apply_state(state, {SERVER_ID}, server_path, passwords={})
+
+        payload = self.client.calls[1][1]
+        self.assertEqual("", payload["password"])
+        self.assertEqual(["ssh-ed25519 " + "A" * 60 + " user@example"], payload["public_keys"])
+        self.assertEqual([{"username": "u42", "password_revision": 0}], reports)
+
+    def test_clear_removes_an_existing_password_and_acks_the_new_revision(self):
+        self.node._password_revisions = {"u42": 1}
+        state = make_state([make_user(password_set=False, password_revision=2)])
+
+        reports = self.node.apply_state(state, {SERVER_ID}, server_path)
+
+        payload = self.client.calls[1][1]
+        self.assertEqual("", payload["password"])
+        self.assertEqual([{"username": "u42", "password_revision": 2}], reports)
+        self.assertEqual({"u42": 2}, self.node._password_revisions)
+
+    def test_a_restarted_agent_still_clears_a_password_it_no_longer_knows(self):
+        state = make_state([make_user(password_set=False, password_revision=4)])
+
+        reports = self.node.apply_state(state, {SERVER_ID}, server_path)
+
+        self.assertEqual("", self.client.calls[1][1]["password"])
+        self.assertEqual([{"username": "u42", "password_revision": 4}], reports)
+
+    def test_a_password_only_account_is_created(self):
+        state = make_state([
+            make_user(keys=[], password_set=True, password_revision=1),
+        ])
+
+        self.node.apply_state(
+            state, {SERVER_ID}, server_path,
+            passwords={"u42": (1, GOOD_PASSWORD)},
+        )
+
+        payload = self.client.calls[1][1]
+        self.assertEqual([], payload["public_keys"])
+        self.assertEqual(GOOD_PASSWORD, payload["password"])
+
+    def test_a_keyless_user_without_a_secret_is_removed_not_created(self):
+        self.client.users = [{"username": "u42"}]
+        state = make_state([make_user(keys=[], password_set=True, password_revision=1)])
+
+        reports = self.node.apply_state(state, {SERVER_ID}, server_path, passwords={})
+
+        self.assertFalse(any(call[0] == "user" for call in self.client.calls))
+        self.assertIn(("delete", "u42"), self.client.calls)
+        self.assertEqual([{"username": "u42", "password_revision": 0}], reports)
+
+    def test_a_new_revision_replaces_the_previous_password(self):
+        self.node._password_revisions = {"u42": 1}
+        state = make_state([make_user(password_set=True, password_revision=2)], revision="rev-2")
+
+        self.node.apply_state(
+            state, {SERVER_ID}, server_path,
+            passwords={"u42": (2, GOOD_PASSWORD + "-new")},
+        )
+
+        self.assertEqual(GOOD_PASSWORD + "-new", self.client.calls[1][1]["password"])
+        self.assertEqual({"u42": 2}, self.node._password_revisions)
+
+    def test_an_incomplete_secret_fetch_is_not_cached(self):
+        state = make_state([make_user(password_set=True, password_revision=1)])
+
+        self.node.apply_state(
+            state, {SERVER_ID}, server_path,
+            passwords={}, passwords_complete=False,
+        )
+
+        self.assertIsNone(self.node._last_revision)
+        self.assertEqual({"u42": 1}, self.node.password_requirements(state))
+        self.assertEqual("", self.client.calls[1][1]["password"])
+
+    def test_a_transient_secret_failure_does_not_clear_a_working_password(self):
+        self.node._password_revisions = {"u42": 1}
+        state = make_state(
+            [make_user(password_set=True, password_revision=2)], revision="rev-2",
+        )
+
+        reports = self.node.apply_state(
+            state, {SERVER_ID}, server_path,
+            passwords={}, passwords_complete=False,
+        )
+
+        self.assertNotIn("password", self.client.calls[1][1])
+        self.assertEqual([{"username": "u42", "password_revision": 1}], reports)
+        self.assertEqual({"u42": 1}, self.node._password_revisions)
+        self.assertEqual({"u42": 2}, self.node.password_requirements(state))
+
+    def test_a_cached_state_returns_the_status_for_a_retry(self):
+        state = make_state([make_user(password_set=True, password_revision=1)])
+        first = self.node.apply_state(
+            state, {SERVER_ID}, server_path,
+            passwords={"u42": (1, GOOD_PASSWORD)},
+        )
+        self.client.calls.clear()
+
+        second = self.node.apply_state(state, {SERVER_ID}, server_path)
+
+        self.assertEqual(first, second)
+        self.assertEqual([], self.client.calls)
+
+    def test_status_reports_are_capped_at_the_master_limit(self):
+        users = [
+            make_user(username=f"u{index}", password_set=True, password_revision=1)
+            for index in range(1, 502)
+        ]
+        state = make_state(users)
+        passwords = {f"u{index}": (1, GOOD_PASSWORD) for index in range(1, 502)}
+
+        reports = self.node.apply_state(
+            state, {SERVER_ID}, server_path, passwords=passwords,
+        )
+
+        self.assertEqual(sftp.MAX_STATUS_USERS, len(reports))
+        self.assertTrue(all(report["password_revision"] == 1 for report in reports))
+
+
+class SftpPasswordSecretParsingTests(unittest.TestCase):
+    def test_a_matching_secret_is_returned(self):
+        payload = {"secrets": [{"username": "u42", "password": GOOD_PASSWORD, "revision": 3}]}
+        self.assertEqual(
+            {"u42": (3, GOOD_PASSWORD)},
+            sftp.parse_password_secrets(payload, {"u42": 3}),
+        )
+
+    def test_other_users_and_stale_revisions_are_ignored(self):
+        payload = {"secrets": [
+            {"username": "u99", "password": GOOD_PASSWORD, "revision": 3},
+            {"username": "u42", "password": GOOD_PASSWORD, "revision": 2},
+        ]}
+        self.assertEqual({}, sftp.parse_password_secrets(payload, {"u42": 3}))
+
+    def test_malformed_secrets_are_rejected(self):
+        cases = [
+            None,
+            {},
+            {"secrets": [None]},
+            {"secrets": [{"username": "alice", "password": GOOD_PASSWORD, "revision": 1}]},
+            {"secrets": [{"username": "u42", "password": "short", "revision": 1}]},
+            {"secrets": [{"username": "u42", "password": GOOD_PASSWORD, "revision": True}]},
+            {"secrets": [
+                {"username": "u42", "password": GOOD_PASSWORD, "revision": 1},
+                {"username": "u42", "password": GOOD_PASSWORD, "revision": 1},
+            ]},
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload):
+                with self.assertRaises(sftp.SftpError):
+                    sftp.parse_password_secrets(payload, {"u42": 1})
+
+
 class FakeHTTPError(urllib.error.HTTPError):
     def __init__(self, url: str, code: int):
         super().__init__(url, code, "error", {}, None)
@@ -413,17 +610,27 @@ class FakeSftp:
         self.fingerprint = fingerprint
         self.ready_calls = 0
         self.applied: list[tuple[dict[str, object], set[str]]] = []
+        self.requirements: dict[str, int] = {}
+        self.passwords: dict[str, tuple[int, str]] = {}
+        self.passwords_complete = True
+        self.reports: list[dict[str, object]] = []
         self.fail_apply = False
 
     def ensure_ready(self):
         self.ready_calls += 1
         return self.fingerprint
 
-    def apply_state(self, state, assigned, resolve):
+    def password_requirements(self, _state):
+        return dict(self.requirements)
+
+    def apply_state(self, state, assigned, resolve, passwords=None, passwords_complete=True):
         if self.fail_apply:
             raise sftp.SftpError("apply failed")
         resolve(SERVER_ID)
         self.applied.append((state, set(assigned)))
+        self.passwords = dict(passwords or {})
+        self.passwords_complete = passwords_complete
+        return list(self.reports)
 
 
 def make_agent_config(root: Path, **overrides):
@@ -458,9 +665,25 @@ class SftpClaimTests(unittest.TestCase):
         self.agent.state = {"node_id": NODE_ID, "credential": "c" * 64, "sequence": 0}
         self.agent._assigned_server_ids = lambda: [SERVER_ID]
         self.requests: list[tuple[str, dict[str, object] | None]] = []
+        self.credential_requests: list[tuple[str, dict[str, object] | None]] = []
+        self.secrets_response: dict[str, object] = {"secrets": [
+            {"username": "u42", "password": GOOD_PASSWORD, "revision": 1},
+        ]}
+        self.fail_secrets = False
+        self.fail_status = False
 
     def _request(self, method, path, body=None, credential=False):
         self.requests.append((path, body))
+        if credential:
+            self.credential_requests.append((path, body))
+        if path.endswith("/sftp/secrets"):
+            if self.fail_secrets:
+                raise agent_module.AgentError("secrets unavailable")
+            return self.secrets_response
+        if path.endswith("/sftp/status"):
+            if self.fail_status:
+                raise agent_module.AgentError("status unavailable")
+            return {}
         if path.endswith("/sftp"):
             return make_state()
         if path.endswith("/commands/claim"):
@@ -476,7 +699,7 @@ class SftpClaimTests(unittest.TestCase):
         self.agent._claim_and_execute()
 
         claim_body = self.requests[-1][1]
-        self.assertEqual(["sftp"], claim_body["features"])
+        self.assertEqual(["sftp", "sftp-password"], claim_body["features"])
         self.assertEqual(FINGERPRINT, claim_body["sftp_host_key_fingerprint"])
         self.assertEqual(1, len(self.sftp.applied))
 
@@ -546,6 +769,108 @@ class SftpClaimTests(unittest.TestCase):
         self.agent._console_tick()
 
         self.assertEqual(0, self.sftp.ready_calls)
+
+    def test_the_password_channel_fetches_applies_and_acknowledges_204(self):
+        self.sftp.requirements = {"u42": 1}
+        self.sftp.reports = [{"username": "u42", "password_revision": 1}]
+        self.agent._request = self._request
+
+        self.agent._sync_sftp()
+
+        paths = [path for path, _body in self.requests]
+        self.assertIn(f"/api/runtime/nodes/{NODE_ID}/sftp/secrets", paths)
+        self.assertIn(f"/api/runtime/nodes/{NODE_ID}/sftp/status", paths)
+        self.assertEqual({"u42": (1, GOOD_PASSWORD)}, self.sftp.passwords)
+        self.assertTrue(self.sftp.passwords_complete)
+        status_body = next(body for path, body in self.requests if path.endswith("/sftp/status"))
+        self.assertEqual({"users": [{"username": "u42", "password_revision": 1}]}, status_body)
+        self.assertIn(
+            f"/api/runtime/nodes/{NODE_ID}/sftp",
+            [path for path, _body in self.credential_requests],
+        )
+        self.assertTrue(all(path.startswith("/api/runtime/nodes/") for path, _ in self.credential_requests))
+        self.assertEqual(["sftp", "sftp-password"], self.agent._sftp_features)
+
+    def test_no_password_requirement_means_no_secret_or_status_request(self):
+        self.agent._request = self._request
+
+        self.agent._sync_sftp()
+
+        paths = [path for path, _body in self.requests]
+        self.assertFalse(any(path.endswith("/sftp/secrets") for path in paths))
+        self.assertFalse(any(path.endswith("/sftp/status") for path in paths))
+        self.assertTrue(self.sftp.passwords_complete)
+
+    def test_a_missing_secret_keeps_keys_and_reports_zero(self):
+        self.sftp.requirements = {"u42": 1}
+        self.sftp.reports = [{"username": "u42", "password_revision": 0}]
+        self.secrets_response = {"secrets": []}
+        self.agent._request = self._request
+
+        self.agent._sync_sftp()
+
+        self.assertEqual({}, self.sftp.passwords)
+        self.assertTrue(self.sftp.passwords_complete)
+        status_body = next(body for path, body in self.requests if path.endswith("/sftp/status"))
+        self.assertEqual({"users": [{"username": "u42", "password_revision": 0}]}, status_body)
+
+    def test_a_secrets_failure_keeps_sftp_and_marks_passwords_incomplete(self):
+        self.sftp.requirements = {"u42": 1}
+        self.sftp.reports = [{"username": "u42", "password_revision": 1}]
+        self.fail_secrets = True
+        self.agent._request = self._request
+
+        with self.assertLogs("craftpilot.runtime_agent", level="WARNING") as captured:
+            self.agent._sync_sftp()
+
+        self.assertFalse(self.sftp.passwords_complete)
+        self.assertEqual(["sftp", "sftp-password"], self.agent._sftp_features)
+        self.assertIn("sftp_secrets_failed", "\n".join(captured.output))
+
+    def test_a_secrets_failure_is_retried_after_backoff_not_on_every_poll(self):
+        self.sftp.requirements = {"u42": 1}
+        self.fail_secrets = True
+        self.agent._request = self._request
+
+        with self.assertLogs("craftpilot.runtime_agent", level="WARNING"):
+            self.agent._sync_sftp()
+        first = sum(1 for path, _ in self.requests if path.endswith("/sftp/secrets"))
+        self.agent._sync_sftp()
+        second = sum(1 for path, _ in self.requests if path.endswith("/sftp/secrets"))
+
+        self.assertEqual(1, first)
+        self.assertEqual(1, second)
+
+    def test_a_status_failure_keeps_sftp_features_for_the_next_retry(self):
+        self.sftp.requirements = {"u42": 1}
+        self.sftp.reports = [{"username": "u42", "password_revision": 1}]
+        self.fail_status = True
+        self.agent._request = self._request
+
+        with self.assertLogs("craftpilot.runtime_agent", level="WARNING") as captured:
+            self.agent._sync_sftp()
+
+        self.assertEqual(["sftp", "sftp-password"], self.agent._sftp_features)
+        self.assertIn("sftp_status_failed", "\n".join(captured.output))
+
+    def test_a_204_status_response_is_accepted_without_json(self):
+        self.agent._opener = FakeOpener([b""])
+        self.assertEqual({}, self.agent._request(
+            "POST", f"/api/runtime/nodes/{NODE_ID}/sftp/status", {"users": []},
+            credential=True,
+        ))
+
+    def test_the_password_never_reaches_state_claim_or_logs(self):
+        self.sftp.requirements = {"u42": 1}
+        self.sftp.reports = [{"username": "u42", "password_revision": 1}]
+        self.agent._request = self._request
+
+        self.agent._sync_sftp()
+        self.agent._claim_and_execute()
+
+        self.assertNotIn(GOOD_PASSWORD, json.dumps(self.agent.store.saved))
+        claim_body = self.requests[-1][1]
+        self.assertNotIn(GOOD_PASSWORD, json.dumps(claim_body))
 
 
 class SftpConfigTests(unittest.TestCase):

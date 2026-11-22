@@ -14,8 +14,11 @@ Säkerhetsregler:
   uid/gid via användarobjektet.
 - Admin-lösenordet genereras en gång och sparas i agentens state-katalog
   (0600). Det loggas aldrig och skrivs aldrig till agent-state.json.
-- Inga användarlösenord hanteras här (den kanalen är ett eget steg); konton
-  utan nyckel skapas därför inte alls.
+- Användarlösenord finns bara i minnet mellan masterns secrets-svar och PUT
+  mot SFTPGo. Revisionen sparas i minnet; klartexten skrivs aldrig till
+  state-filen, loggar, statusrapporten eller claimen.
+- Ett konto får aldrig sakna autentiseringsmetod: utan publik nyckel krävs
+  ett tillämpat lösenord, annars tas kontot bort.
 """
 
 from __future__ import annotations
@@ -48,12 +51,59 @@ DEFAULT_ADMIN_URL = "http://craftpilot-sftp:8080"
 DEFAULT_HOME_ROOT = "/sftp-home"
 ADMIN_PASSWORD_FILE = "sftpgo-admin-password"
 
+FEATURE_SFTP = "sftp"
+FEATURE_SFTP_PASSWORD = "sftp-password"
+PASSWORD_MIN_LENGTH = 12
+PASSWORD_MAX_LENGTH = 256
+MAX_STATUS_USERS = 500
+MAX_SECRETS_USERS = 1000
+MAX_REVISION = 4294967295
+
 USERNAME_RE = re.compile(r"^u[1-9][0-9]{0,18}$")
 SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,200}$")
 FINGERPRINT_RE = re.compile(r"^SHA256:[A-Za-z0-9+/]{43}$")
 ADMIN_PASSWORD_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def parse_password_secrets(payload: Any, requirements: dict[str, int]) -> dict[str, tuple[int, str]]:
+    """Validera masterns engångshemligheter och behåll bara det vi behöver.
+
+    Returvärdet finns bara i anroparens minne. Ett svar för en annan användare
+    eller en annan revision ignoreras; agenten applicerar aldrig en hemlighet
+    som inte matchar state. Själva lösenordet loggas aldrig.
+    """
+
+    if not isinstance(payload, dict):
+        raise SftpError("SFTP secrets response is invalid")
+    secrets = payload.get("secrets")
+    if not isinstance(secrets, list) or len(secrets) > MAX_SECRETS_USERS:
+        raise SftpError("SFTP secrets response is invalid")
+
+    parsed: dict[str, tuple[int, str]] = {}
+    for entry in secrets:
+        if not isinstance(entry, dict):
+            raise SftpError("SFTP secret entry is invalid")
+        username = entry.get("username")
+        revision = entry.get("revision")
+        password = entry.get("password")
+        if not isinstance(username, str) or not USERNAME_RE.fullmatch(username):
+            raise SftpError("SFTP secret username is invalid")
+        if (isinstance(revision, bool) or not isinstance(revision, int)
+                or not 0 <= revision <= MAX_REVISION):
+            raise SftpError("SFTP secret revision is invalid")
+        if (not isinstance(password, str) or not PASSWORD_MIN_LENGTH <= len(password) <= PASSWORD_MAX_LENGTH
+                or "\x00" in password):
+            raise SftpError("SFTP secret password is invalid")
+
+        if username not in requirements or revision != requirements[username]:
+            continue
+        if username in parsed:
+            raise SftpError("SFTP secrets response contains a duplicate user")
+        parsed[username] = (revision, password)
+    return parsed
+
 
 # En container som inte svarar startas om högst så här ofta; annars skulle en
 # trasig SFTPGo bilda en start-loop mot Docker.
@@ -307,6 +357,8 @@ class SftpNode:
         self._docker_available = docker_available or (lambda: shutil.which("docker") is not None)
         self._client: SftpGoClient | None = None
         self._last_revision: str | None = None
+        self._password_revisions: dict[str, int] = {}
+        self._last_status: list[dict[str, Any]] = []
         self._last_start_attempt = 0.0
         self._container_restarted = False
 
@@ -436,6 +488,10 @@ class SftpNode:
         result = self._docker(args, timeout=120)
         if result.returncode != 0:
             raise SftpError("could not create the SFTPGo container")
+        # En ny databas har inga lösenord; gamla minnesrevisioner får inte
+        # hindra att masterns hemligheter hämtas igen.
+        self._password_revisions.clear()
+        self._last_status = []
 
     def _restart_container(self) -> None:
         """Ett startförsök per backoff-fönster när healthchecken fallerar."""
@@ -452,21 +508,98 @@ class SftpNode:
 
     # -- state-synk --------------------------------------------------------
 
-    def apply_state(self, state: Any, assigned_server_ids: set[str],
-                    resolve_server_path: Callable[[str], str]) -> None:
-        """Applicera masterns fullständiga önskade läge, idempotent."""
+    def password_requirements(self, state: Any) -> dict[str, int]:
+        """Användare vars lokala lösenordsrevision är äldre än masterns.
+
+        Efter en lyckad applicering (även med tom secrets-lista) är revisionen
+        cachad och inget nytt hämtas förrän state ändras. Det håller
+        secrets-endpointens budget och undviker att TTL-missar blir en loop.
+        """
 
         revision, users = self._parse_state(state)
         if revision == self._last_revision and not self._container_restarted:
-            return
+            return {}
+
+        requirements: dict[str, int] = {}
+        for entry in users:
+            if not entry["password_set"]:
+                continue
+            state_revision = entry["password_revision"]
+            if state_revision > self._password_revisions.get(entry["username"], 0):
+                requirements[entry["username"]] = state_revision
+        return requirements
+
+    def apply_state(self, state: Any, assigned_server_ids: set[str],
+                    resolve_server_path: Callable[[str], str],
+                    passwords: dict[str, tuple[int, str]] | None = None,
+                    passwords_complete: bool = True) -> list[dict[str, Any]]:
+        """Applicera masterns fullständiga önskade läge, idempotent.
+
+        `passwords` är username -> (revision, klartext) och finns bara i
+        anropets minne. Returvärdet är kvittensrader (username + revision),
+        aldrig lösenord. `passwords_complete=False` betyder att hemligheterna
+        inte kunde hämtas; då cachas inte revisionen så nästa poll försöker
+        igen, men nyckelbaserade konton fungerar under tiden.
+        """
+
+        revision, users = self._parse_state(state)
+        if revision == self._last_revision and not self._container_restarted:
+            return list(self._last_status)
 
         client = self._client_instance()
+        secrets = passwords or {}
         folders: dict[str, str] = {}
         prepared: list[dict[str, Any]] = []
+        status_reports: list[dict[str, Any]] = []
+        next_revisions: dict[str, int] = {}
 
         for entry in users:
             username = entry["username"]
             public_keys = entry["public_keys"]
+            state_revision = entry["password_revision"]
+            local_revision = self._password_revisions.get(username, 0)
+            password_value: str | None = None
+
+            if entry["password_set"]:
+                if local_revision >= state_revision:
+                    # Redan applicerad: utelämnat password bevarar SFTPGo:s hash.
+                    local_revision = max(local_revision, state_revision)
+                elif not passwords_complete and local_revision > 0:
+                    # Tillfälligt secrets-fel: behåll det fungerande lösenordet
+                    # och rapportera den äldre revisionen. Nästa poll försöker
+                    # igen; först ett bekräftat tomt svar får rensa.
+                    pass
+                else:
+                    secret = secrets.get(username)
+                    if secret is not None and secret[0] == state_revision:
+                        password_value = secret[1]
+                        local_revision = state_revision
+                    else:
+                        # Ingen användbar hemlighet (TTL, kanal av, fel revision):
+                        # ta bort ett gammalt lösenord i stället för att ljuga.
+                        password_value = ""
+                        local_revision = 0
+            else:
+                # Clear/disable kräver ingen hemlighet. Revisionen höjs även
+                # när lösenordet tas bort, så noden måste kvittera den.
+                if state_revision > 0 or local_revision > 0:
+                    password_value = ""
+                local_revision = state_revision
+
+            has_password = (password_value not in (None, "")) or (
+                entry["password_set"] and local_revision > 0
+            )
+            if not public_keys and not has_password:
+                # Aldrig ett konto utan autentiseringsmetod. Ett befintligt
+                # konto tas bort av städningen nedan, och revisionen rapporteras
+                # så panelen kan säga att lösenordet saknas.
+                if entry["password_set"] or state_revision > 0 or local_revision > 0:
+                    status_reports.append({
+                        "username": username,
+                        "password_revision": local_revision,
+                    })
+                continue
+
             virtual_folders = []
             permissions: dict[str, list[str]] = {"/": ["list"]}
 
@@ -481,12 +614,7 @@ class SftpNode:
                 virtual_folders.append({"name": name, "virtual_path": f"/{name}"})
                 permissions[f"/{name}"] = ["*"]
 
-            # Inget lösenord i den här etappen: ett konto utan nycklar skulle
-            # sakna autentiseringsmetod och får därför inte skapas.
-            if not public_keys:
-                continue
-
-            prepared.append({
+            payload = {
                 "status": 1 if entry["enabled"] else 0,
                 "username": username,
                 "home_dir": f"{self.settings.home_root}/{username}",
@@ -495,7 +623,18 @@ class SftpNode:
                 "permissions": permissions,
                 "public_keys": public_keys,
                 "virtual_folders": virtual_folders,
-            })
+            }
+            # password utelämnas när det redan är applicerat; tom sträng rensar
+            # (verifierat mot SFTPGo 2.6.4 och masterns SftpUserSpec).
+            if password_value is not None:
+                payload["password"] = password_value
+            prepared.append(payload)
+            next_revisions[username] = local_revision
+            if entry["password_set"] or state_revision > 0 or local_revision > 0:
+                status_reports.append({
+                    "username": username,
+                    "password_revision": local_revision,
+                })
 
         for name, mapped_path in folders.items():
             client.ensure_folder(name, mapped_path)
@@ -508,9 +647,18 @@ class SftpNode:
             username = existing.get("username")
             if isinstance(username, str) and USERNAME_RE.fullmatch(username) and username not in desired:
                 client.delete_user(username)
+                next_revisions.pop(username, None)
 
-        self._last_revision = revision
-        self._container_restarted = False
+        if len(status_reports) > MAX_STATUS_USERS:
+            LOGGER.warning("sftp_status_too_many_users count=%d", len(status_reports))
+            status_reports = status_reports[:MAX_STATUS_USERS]
+
+        self._password_revisions = next_revisions
+        self._last_status = status_reports
+        if passwords_complete:
+            self._last_revision = revision
+            self._container_restarted = False
+        return list(status_reports)
 
     @staticmethod
     def _parse_state(state: Any) -> tuple[str, list[dict[str, Any]]]:
@@ -533,6 +681,14 @@ class SftpNode:
             enabled = entry.get("enabled")
             if not isinstance(enabled, bool):
                 raise SftpError("SFTP state enabled flag is invalid")
+
+            password_set = entry.get("password_set", False)
+            if not isinstance(password_set, bool):
+                raise SftpError("SFTP state password flag is invalid")
+            password_revision = entry.get("password_revision", 0)
+            if (isinstance(password_revision, bool) or not isinstance(password_revision, int)
+                    or not 0 <= password_revision <= MAX_REVISION):
+                raise SftpError("SFTP state password revision is invalid")
 
             public_keys = entry.get("public_keys")
             if not isinstance(public_keys, list) or len(public_keys) > 100:
@@ -567,6 +723,8 @@ class SftpNode:
                 "username": username,
                 "enabled": enabled,
                 "public_keys": keys,
+                "password_set": password_set,
+                "password_revision": password_revision,
                 "folders": folders,
             })
         return revision, parsed

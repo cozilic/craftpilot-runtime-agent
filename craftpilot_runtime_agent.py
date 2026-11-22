@@ -1661,6 +1661,9 @@ class RuntimeNodeAgent:
         # inget den här gången; mastern behåller då sitt sparade värde.
         self._sftp_features: list[str] | None = None
         self._sftp_fingerprint: str | None = None
+        # Secrets-endpointen har 10/min; ett tillfälligt fel får inte leda till
+        # ett anrop varje poll. Klartexten finns aldrig här, bara tidsstämpeln.
+        self._sftp_secret_retry_at = 0.0
         self.file_tree_index = file_tree_index.FileTreeIndex(config.data_root, config.state_dir)
         self._last_file_tree_progress = self.file_tree_index.progress
         self._last_reported_file_tree_progress: str | None = None
@@ -1971,9 +1974,47 @@ class RuntimeNodeAgent:
                 self._sftp_features = None
                 self._sftp_fingerprint = None
                 return
-            state = self._request("GET", f"/api/runtime/nodes/{self.config.node_id}/sftp")
-            self.sftp.apply_state(state, set(self._assigned_server_ids()), self._sftp_server_path)
-            self._sftp_features = ["sftp"]
+            state = self._request(
+                "GET", f"/api/runtime/nodes/{self.config.node_id}/sftp", credential=True,
+            )
+            requirements = self.sftp.password_requirements(state)
+            passwords: dict[str, tuple[int, str]] = {}
+            passwords_complete = True
+            if requirements and time.monotonic() >= self._sftp_secret_retry_at:
+                try:
+                    secret_response = self._request(
+                        "POST", f"/api/runtime/nodes/{self.config.node_id}/sftp/secrets",
+                        None, credential=True,
+                    )
+                    passwords = sftp_runtime.parse_password_secrets(secret_response, requirements)
+                    self._sftp_secret_retry_at = 0.0
+                except CredentialRejectedError:
+                    raise
+                except (AgentError, sftp_runtime.SftpError, OSError, TimeoutError) as exc:
+                    # Nyckelbaserade konton fungerar vidare; revisionen cachas
+                    # inte, så nästa poll försöker igen efter backoff.
+                    passwords_complete = False
+                    self._sftp_secret_retry_at = time.monotonic() + 30.0
+                    LOGGER.warning("sftp_secrets_failed error=%s", str(exc)[:200])
+            elif requirements:
+                passwords_complete = False
+
+            reports = self.sftp.apply_state(
+                state, set(self._assigned_server_ids()), self._sftp_server_path,
+                passwords=passwords, passwords_complete=passwords_complete,
+            )
+            if reports:
+                try:
+                    self._request(
+                        "POST", f"/api/runtime/nodes/{self.config.node_id}/sftp/status",
+                        {"users": reports}, credential=True,
+                    )
+                except CredentialRejectedError:
+                    raise
+                except (AgentError, OSError, TimeoutError) as exc:
+                    # SFTP fungerar; kvittensen försöks igen nästa poll.
+                    LOGGER.warning("sftp_status_failed error=%s", str(exc)[:200])
+            self._sftp_features = [sftp_runtime.FEATURE_SFTP, sftp_runtime.FEATURE_SFTP_PASSWORD]
             self._sftp_fingerprint = fingerprint
         except CredentialRejectedError:
             raise
@@ -2721,6 +2762,9 @@ class RuntimeNodeAgent:
             raise AgentError("could not reach the CraftPilot master") from exc
         if len(raw) > 1024 * 1024:
             raise AgentError("master response exceeded the size limit")
+        if not raw.strip():
+            # 204 från t.ex. SFTP-statuskvittensen har ingen kropp.
+            return {}
         try:
             decoded = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
