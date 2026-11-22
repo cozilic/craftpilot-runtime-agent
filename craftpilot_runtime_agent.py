@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 
 import file_tree_index
 import migration_transfer
+import network_stats
 import process_runtime
 import sftp_runtime
 from pathlib import Path
@@ -2344,6 +2345,11 @@ class RuntimeNodeAgent:
             if not logs:
                 continue
             report = {**cached, "sequence": sequence, "logs": logs}
+            # Räknarna är kumulativa: att skicka det cachade värdet igen hade
+            # gett mastern ett falskt nolldelta (och en spik vid nästa poll).
+            # Mät om i stället; misslyckas det utelämnas mätningen.
+            if report.get("network_rx_bytes") is not None or report.get("network_tx_bytes") is not None:
+                report["network_rx_bytes"], report["network_tx_bytes"] = self._container_net_io(name)
             try:
                 self._request("POST", f"/api/runtime/nodes/{self.config.node_id}/servers/report", report, credential=True)
             except HttpStatusError as exc:
@@ -2444,6 +2450,7 @@ class RuntimeNodeAgent:
             return {
                 "sequence": sequence, "server_id": server_id, "status": "OFFLINE",
                 "cpu_percent": None, "memory_used_mb": None, "memory_limit_mb": None,
+                "network_rx_bytes": None, "network_tx_bytes": None,
                 "uptime_seconds": None, "players_online": None, "players_max": None,
                 "disk_used_mb": self.runtime._server_disk_used_mb(server_id),
                 "artifact_present": self._artifact_present(server_id, artifact_check), "logs": [],
@@ -2470,6 +2477,7 @@ class RuntimeNodeAgent:
             status = {"running": "ONLINE", "created": "STARTING", "restarting": "STARTING",
                       "paused": "STOPPING", "dead": "CRASHED"}.get(state or "", "ERROR")
         cpu_percent = memory_used_mb = memory_limit_mb = None
+        network_rx_bytes = network_tx_bytes = None
         if running == "true":
             try:
                 stats = self.runtime._run(["docker", "stats", "--no-stream", "--format",
@@ -2481,6 +2489,8 @@ class RuntimeNodeAgent:
             started_at = self.runtime._run(["docker", "inspect", "--format", "{{.State.StartedAt}}", name], timeout=10).strip()
         except (DockerError, OSError, TimeoutError):
             started_at = ""
+        if running == "true":
+            network_rx_bytes, network_tx_bytes = self._container_net_io(name)
         disk_used_mb = self.runtime._server_disk_used_mb(server_id)
         try:
             logs = self.runtime._logs_for_server(server_id, name, log_since)
@@ -2488,6 +2498,7 @@ class RuntimeNodeAgent:
             logs = []
         return {"sequence": sequence, "server_id": server_id, "status": status, "cpu_percent": cpu_percent,
                 "memory_used_mb": memory_used_mb, "memory_limit_mb": memory_limit_mb,
+                "network_rx_bytes": network_rx_bytes, "network_tx_bytes": network_tx_bytes,
                 "uptime_seconds": self._uptime_seconds(started_at) if running == "true" else None,
                 "players_online": None, "players_max": None, "disk_used_mb": disk_used_mb,
                 "artifact_present": self._artifact_present(server_id, artifact_check), "logs": logs}
@@ -2514,6 +2525,7 @@ class RuntimeNodeAgent:
             return {
                 "sequence": sequence, "server_id": server_id, "status": "OFFLINE",
                 "cpu_percent": None, "memory_used_mb": None, "memory_limit_mb": None,
+                "network_rx_bytes": None, "network_tx_bytes": None,
                 "uptime_seconds": None, "players_online": None, "players_max": None,
                 "disk_used_mb": self.runtime._server_disk_used_mb(server_id),
                 "artifact_present": self._artifact_present(server_id, artifact_check), "logs": [],
@@ -2549,6 +2561,7 @@ class RuntimeNodeAgent:
             "sequence": sequence, "server_id": server_id, "status": reported_status,
             "cpu_percent": None, "memory_used_mb": None,
             "memory_limit_mb": memory_limit if isinstance(memory_limit, int) else None,
+            "network_rx_bytes": None, "network_tx_bytes": None,
             "uptime_seconds": self._uptime_seconds(started_at) if running and isinstance(started_at, str) else None,
             "players_online": None, "players_max": None,
             "disk_used_mb": self.runtime._server_disk_used_mb(server_id),
@@ -2572,6 +2585,27 @@ class RuntimeNodeAgent:
             return False
         except (AgentError, OSError, KeyError, TypeError):
             return None
+
+    def _container_net_io(self, name: str) -> tuple[int | None, int | None]:
+        """Kumulativa (rx, tx) byte ur Docker Engine API, annars (None, None).
+
+        Källan är stats-endpointen och inte `docker stats`-CLI:t, som avrundar
+        NetIO. Räknarna skickas som heltal — mastern räknar bytes/s — och ett
+        fel här får aldrig stoppa rapporten: hellre `null` än en försenad
+        status. Endast en körande container når hit.
+        """
+        container_id_of = getattr(self.runtime, "_container_id", None)
+        try:
+            container_id = container_id_of(name) if callable(container_id_of) else None
+            if container_id is None:
+                return None, None
+            measured = network_stats.container_net_io(container_id)
+        except (AgentError, DockerError, OSError, TimeoutError, ValueError):
+            return None, None
+        if measured is None:
+            return None, None
+        rx, tx = measured
+        return rx, tx
 
     @staticmethod
     def _parse_docker_stats(output: str) -> tuple[float | None, int | None, int | None]:
