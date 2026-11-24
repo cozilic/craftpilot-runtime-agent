@@ -93,7 +93,7 @@ Do not run the Linux `setup.sh` from PowerShell or execute the Compose project f
 
 ### Windows executable (process nodes without Docker)
 
-A node registered as `runtime_kind=process` does not need Docker at all, and the agent is also published as a standalone Windows executable. `.github/workflows/build-windows-exe.yml` runs the test suite, builds `craftpilot-agent.exe` with PyInstaller and uploads it as the `craftpilot-agent-windows` artifact on every `v*` tag, or on demand through *Run workflow*.
+A node registered as `runtime_kind=process` does not need Docker at all, and the agent is also published as a standalone Windows executable. `.github/workflows/build-windows-exe.yml` runs the test suite, builds `craftpilot-agent.exe` with PyInstaller and uploads it as the `craftpilot-agent-windows` artifact on every `v*` tag, or on demand through *Run workflow*. On a tag it also attaches `craftpilot-agent.exe` and its `.sha256` to that tag's GitHub release, so a process node can download the executable without a GitHub login.
 
 Download and unpack the artifact, then configure the node with environment variables and start it:
 
